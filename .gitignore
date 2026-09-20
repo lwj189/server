@@ -1,0 +1,21 @@
+# Windows 系统自动生成
+desktop.ini
+
+# 编译产物
+*.o
+*.out
+*.exe
+a.out
+p2
+p3
+p4
+
+# CI / 测试产生的日志
+build.log
+server.log
+
+# 压测产物（jtl 结果 + 服务器日志，文件很大）
+tests/results/
+
+# JMeter 自己的日志（加了 -j 后不会落在这里，兜底）
+jmeter.log

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: 严格编译 p2 + 冒烟/健壮性测试
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 显示环境信息
+        run: |
+          uname -a
+          g++ --version | head -1
+          python3 --version
+
+      - name: 严格编译 p2.cpp（有警告就算失败）
+        run: |
+          if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 2> build.log; then
+            echo "::error::编译失败"
+            cat build.log
+            exit 1
+          fi
+          if [ -s build.log ]; then
+            echo "::error::编译有警告，先修干净再提交"
+            cat build.log
+            exit 1
+          fi
+          echo "编译通过（零错误零警告）"
+
+      - name: 启动服务器并运行测试
+        run: |
+          set -e
+          ./p2 > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "服务器已启动，pid=$SERVER_PID，等待进入 LISTEN ..."
+
+          for _ in $(seq 1 25); do
+            if ss -tln 2>/dev/null | grep -q ':8888 '; then break; fi
+            sleep 0.2
+          done
+          echo "---- 监听状态 ----"
+          ss -tlnp 2>/dev/null | grep 8888 || { echo "::error::服务器没有进入 LISTEN"; cat server.log; exit 1; }
+
+          set +e
+          python3 tests/p2_test.py
+          RESULT=$?
+          set -e
+
+          kill $SERVER_PID 2>/dev/null || true
+          echo "---- 服务器日志 ----"
+          cat server.log
+          echo "测试退出码 = $RESULT"
+          exit $RESULT

@@ -1,0 +1,40 @@
+# clang-format 配置 —— 约束 VSCode 的"格式化文档 / 保存时格式化"
+#
+# 用法：
+#   - VSCode: Shift+Alt+F（格式化文档），或保存时自动执行（editor.formatOnSave）
+#   - 命令行: clang-format -i p2.cpp
+#
+# 这份配置的目标：尽量贴近本项目手写的风格，只修真正的错误
+# （缩进层级错乱、int reuse= 1 缺空格、#include<iostream> 缺空格），
+# 不做无谓的风格改动。
+
+BasedOnStyle: LLVM
+
+# ---- 缩进：4 个空格，不用 Tab 字符 ----
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# ---- 花括号跟在语句同一行：if (...) {   而不是另起一行（那是 Allman/Microsoft 风格）----
+BreakBeforeBraces: Attach
+
+# ---- 不排序 include ----
+# 默认会按字母重排 include，可能打乱"先系统头再项目头"的意图。这里保持你写的顺序。
+SortIncludes: false
+
+# ---- 指针/引用的星号贴左边：struct sockaddr* / char* p ----
+# （默认 Right 会改成 struct sockaddr *，和现有代码不一致，diff 会很大）
+PointerAlignment: Left
+
+# ---- 保留紧凑的单行写法 ----
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: Always
+AllowShortFunctionsOnASingleLine: All
+
+# ---- 不自动折行 ----
+# clang-format 按"列"算宽度，中文一个字算好几列，会把中文注释从中间切断。
+# 所以直接关掉列宽限制。
+ColumnLimit: 0
+
+# ---- 连续空行最多保留 2 行 ----
+MaxEmptyLinesToKeep: 2

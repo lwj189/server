@@ -6,10 +6,14 @@
 #include <cstdio>         // perror
 #include <unistd.h>       // close / pause
 #include <arpa/inet.h>    // inet_ntop
+#include <csignal>
 
 constexpr uint16_t PORT = 8888;   // 监听端口
 
 int main() {
+
+    signal(SIGPIPE, SIG_IGN);
+
     // ---- 步骤 1：创建 socket ----
     // AF_INET = IPv4；SOCK_STREAM = 可靠字节流(TCP)；0 = 默认协议
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -75,34 +79,26 @@ int main() {
             // ---- CP4：返回 HTTP 响应 ----
             // 消息结构（RFC 9112 §2.1）：
             //   HTTP-message = start-line CRLF *( field-line CRLF ) CRLF [ message-body ]
-            //
-            // 需要你自己填的两个参数：
-            //   ① Content-Length 的值：它要表达"消息体有多少字节"，消息体是哪个变量？
-            //   ② send 的第一个参数：要发给哪条连接？（总机还是分机？）
             std::string body = "<h1>Hello from my own server!</h1>";
             std::string response =
                 "HTTP/1.1 200 OK\r\n"         // start-line
                 "Content-Type: text/html\r\n" // field-line
-                "Content-Length: " +
-                std::to_string(body.size()) + "\r\n"                  // field-line（①）
-                                              "Connection: close\r\n" // field-line
-                                              "\r\n" +                // 单独一个 CRLF = 空行
-                body;                                                 // message-body
+                "Content-Length: " +std::to_string(body.size()) + "\r\n"// field-line（①）
+                "Connection: close\r\n" // field-line
+                "\r\n" +                // 单独一个 CRLF = 空行
+                body;
+
+            // flags 填 0：man 2 send 说 "with a zero flags argument, send() is equivalent to write(2)"
+            ssize_t sent = send(conn_fd, response.c_str(), response.size(), 0); // （②）
+            if (sent < 0) {
+                perror("send");
+            } 
 
         } else if (n == 0) {
             std::cout << "客户端主动关闭了连接" << std::endl;
         } else {
             perror("read");
         }
-
-        
-        // flags 填 0：man 2 send 说 "with a zero flags argument, send() is equivalent to write(2)"
-        ssize_t sent = send(conn_fd, response.c_str(), response.size(), 0);   // （②）
-        if (sent < 0) {
-            perror("send");
-        }
-
-        // 想一想：n <= 0（没收到请求）时，还需要发这个响应吗？
 
         // 这条连接处理完了，关掉分机；server_fd（总机）要一直留着
         close(conn_fd);

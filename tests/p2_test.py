@@ -10,14 +10,21 @@ p2 服务器的冒烟测试 + 健壮性测试
            PORT=9999 python3 tests/p2_test.py
 
 测什么：
-    [1] 正常请求   完整 GET → 200，响应体和 Content-Length 都对
-    [2] 连上就关   客户端一个字节都不发就关闭 → 服务器必须活下来
-    [3] RST 强断   发一半请求后用 SO_LINGER=0 强制发 RST → 服务器必须活下来
-    [4] 并发 20    20 个请求全部返回 200
-    [5] 半包观察   分两段发送，只打印现象，不计入失败（等 CP5 修）
+    [1] 正常请求     完整 GET → 200，响应体 / Content-Length / Content-Type 都对
+    [2] 连上就关     客户端一个字节都不发就关闭 → 服务器必须活下来
+    [3] RST 强断     发一半请求后用 SO_LINGER=0 强制发 RST → 服务器必须活下来
+    [4] 并发 20      20 个请求全部返回 200
+    [5] 半包         请求分两段发送（间隔 0.5s）→ 必须收全再响应（CP5a）
+    [6] 极端半包     请求逐字节发送 → 必须收全再响应（CP5a）
+    [7] 超长请求头   发 16KB 不含 \\r\\n\\r\\n 的数据 → 必须拒绝或断开（CP5a 的大小上限）
+    [8] POST body    Content-Length 声明的 body 完整送达 → 200（CP5b）
+    [9] body 未齐    只发一半 body 时 → 服务器绝不能提前响应（CP5b 核心）
+    [10] 超大 body   Content-Length 声明 64MB → 必须拒绝或断开，不能无限等（CP5b）
 
-    [2][3] 是"单个坏客户端不该杀死服务器"的回归测试
-    （对应：响应只在 n > 0 时发送 + 忽略 SIGPIPE）
+    [2][3] 对应"响应只在 n > 0 时发送 + 忽略 SIGPIPE"的回归测试
+    [5][6] 对应"按连接读缓冲区，攒够完整请求再处理"
+    [7]    对应 MAX_HEADER_SIZE（没有上限的实现会一直等下去 = DoS）
+    [8][9][10] 对应"头部完整 ≠ 请求完整"：还要按 Content-Length 把 body 收全
 
 退出码：0 = 全部通过，1 = 有失败，2 = 连不上服务器
 """
@@ -191,19 +198,174 @@ def t4_concurrent(r, n=20):
 
 
 def t5_partial_request(r):
-    """半包观察：分两段发送。
+    """半包：请求分两段发送（中间隔 0.5s），服务器必须收全再响应。
 
-    注意：p2 目前只 read 一次，不等一个完整请求。所以这里只打印现象，
-    不作为失败 —— 等 CP5 加上"按连接缓冲区"之后，才应该断言必须收全。
+    CP5a 之前这里只能"观察"；现在是硬断言 —— 收不全就不该回 200。
     """
-    print('\n[5] 半包观察：请求分两段发送（间隔 0.5s）—— 不计入失败')
+    print('\n[5] 半包：请求分两段发送（间隔 0.5s）')
     resp = talk(pieces=[
         b'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n',
         b'Connection: close\r\n\r\n',
     ], gap=0.5)
+    status, _, body = parse(resp)
+    r.check('返回 200（说明收全了完整请求才响应）', status == 200,
+            '实际=%s' % status)
+    r.check('响应体完整', body == EXPECT_BODY, '实际=%r' % body[:60])
+
+
+def t6_byte_by_byte(r):
+    """极端半包：请求的每个字节单独发送（最恶劣的拆包方式）"""
+    print('\n[6] 极端半包：请求逐字节发送（每字节间隔 5ms，共 %d 字节）' % len(REQUEST))
+    pieces = [bytes([b]) for b in REQUEST]
+    resp = talk(pieces=pieces, gap=0.005, timeout=5.0)
+    status, _, body = parse(resp)
+    r.check('逐字节发送仍返回 200', status == 200, '实际=%s' % status)
+    r.check('响应体完整', body == EXPECT_BODY, '实际=%r' % body[:60])
+
+
+def t7_oversized_header(r, nbytes=16 * 1024, wait=2.0):
+    """安全上限：发一批永远不含 CRLF CRLF 的数据。
+
+    正确行为：服务器主动断开，或返回 431（Request Header Fields Too Large）/ 413。
+    错误行为：一直 read 等下去 —— 那意味着 read_buffer 会随客户端发送量无限增长（DoS）。
+
+    "连接被断开" 和 "服务器还在傻等" 必须区分开：
+      recv 返回 b'' 或抛 ConnectionError → 断开（正确）
+      recv 超时（socket.timeout）        → 还在等（没有上限，错误）
+    """
+    print('\n[7] 超长请求头：发送 %d KB 不含 \\r\\n\\r\\n 的数据' % (nbytes // 1024))
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    closed = False
+    data = b''
+    try:
+        s.sendall(b'X' * nbytes)
+        s.settimeout(wait)
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break                       # 服务器还在等 → 没有上限
+            except ConnectionError:
+                closed = True               # 被 RST / 连接异常
+                break
+            if not chunk:
+                closed = True               # 对端正常关闭
+                break
+            data += chunk
+    finally:
+        s.close()
+
+    status, _, _ = parse(data)
+    if closed:
+        r.info('服务器的处理方式', '直接断开了连接（可以接受）')
+        r.check('超长请求头被拒绝或断开', True)
+    elif status in (431, 413):
+        r.info('服务器的处理方式', '返回了 %s（最规范的做法）' % status)
+        r.check('超长请求头被拒绝或断开', True)
+    else:
+        r.check('超长请求头被拒绝或断开', False,
+                '%ds 内既没回错误也没断开 —— 说明没有请求头大小上限，'
+                'read_buffer 会无限增长（DoS）' % wait)
+
+    time.sleep(0.3)
+    ok, detail = normal_get_ok()
+    r.check('之后服务器仍能正常服务', ok, detail)
+
+
+def t8_post_with_body(r):
+    """CP5b：带 body 的 POST —— 头部 + 完整 body 一起送达，应当返回 200"""
+    print('\n[8] POST 请求：Content-Length 声明的 body 完整送达')
+    body = b'name=Bob&age=25'
+    req = (b'POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+           b'Content-Length: %d\r\nConnection: close\r\n\r\n' % len(body)) + body
+    resp = talk(payload=req)
     status, _, _ = parse(resp)
-    r.info('服务器对半包请求的响应', '状态码=%s（当前：能回，但是基于不完整的请求）' % status)
-    r.info('待办', 'CP5 要实现"读缓冲区攒够完整请求再处理"')
+    r.check('返回 200（带 body 的请求被正确处理）', status == 200, '实际=%s' % status)
+
+
+def t9_body_split_no_early_response(r):
+    """CP5b 核心：Content-Length 声明 10 字节，先只发 5 字节。
+
+    服务器不能因为"头部已经以 CRLF CRLF 结束"就提前响应 —— 必须等 body 收齐。
+    """
+    print('\n[9] body 未到齐：先发 5 字节 body，1 秒后补剩下的 5 字节')
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    try:
+        s.sendall(b'POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                  b'Content-Length: 10\r\nConnection: close\r\n\r\n'
+                  b'hello')                             # body 只发了 5 / 10
+        s.settimeout(1.0)
+        early = b''
+        try:
+            early = s.recv(4096)
+        except socket.timeout:
+            pass                                        # 超时 = 服务器在等 body（正确）
+        except ConnectionError:
+            pass
+        r.check('body 没到齐时服务器不响应', early == b'',
+                '服务器提前响应了：%r' % early[:40])
+
+        s.sendall(b'world')                             # 补齐 body
+        s.settimeout(3.0)
+        data = b''
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except (socket.timeout, ConnectionError):
+                break
+            if not chunk:
+                break
+            data += chunk
+        status, _, _ = parse(data)
+        r.check('补齐 body 后返回 200', status == 200, '实际=%s' % status)
+    finally:
+        s.close()
+
+
+def t10_oversized_body(r, declared=64 * 1024 * 1024, wait=2.0):
+    """CP5b：声明超大 body 却一个字节都不发 —— 必须拒绝或断开，不能无限等。"""
+    print('\n[10] 超大 body：Content-Length: %d（%d MB），但一个字节都不发'
+          % (declared, declared // 1024 // 1024))
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    closed = False
+    data = b''
+    try:
+        s.sendall(b'POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                  b'Content-Length: %d\r\nConnection: close\r\n\r\n' % declared)
+        s.settimeout(wait)
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break                                   # 服务器还在等 → 没有 body 上限
+            except ConnectionError:
+                closed = True
+                break
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+    finally:
+        s.close()
+
+    status, _, _ = parse(data)
+    if status is not None and 200 <= status < 300:
+        r.check('超大 body 被拒绝或断开', False,
+                '服务器对"声明 %dMB body 却一个字节没发"的请求直接回了 %s '
+                '—— 既没等 body，也没有大小上限' % (declared // 1024 // 1024, status))
+    elif closed:
+        r.info('服务器的处理方式', '直接断开了连接（可以接受）')
+        r.check('超大 body 被拒绝或断开', True)
+    elif status in (413, 431, 400):
+        r.info('服务器的处理方式', '返回了 %s' % status)
+        r.check('超大 body 被拒绝或断开', True)
+    else:
+        r.check('超大 body 被拒绝或断开', False,
+                '%ds 内既没回错误也没断开 —— 没有 body 大小上限' % wait)
+
+    time.sleep(0.3)
+    ok, detail = normal_get_ok()
+    r.check('之后服务器仍能正常服务', ok, detail)
 
 
 # ----------------------------------------------------------------------
@@ -235,6 +397,11 @@ def main():
     t3_abortive_close(r)
     t4_concurrent(r)
     t5_partial_request(r)
+    t6_byte_by_byte(r)
+    t7_oversized_header(r)
+    t8_post_with_body(r)
+    t9_body_split_no_early_response(r)
+    t10_oversized_body(r)
 
     print('\n' + '=' * 64)
     print(' 结果：通过 %d 项，失败 %d 项' % (r.passed, r.failed))

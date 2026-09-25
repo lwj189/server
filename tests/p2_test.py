@@ -368,6 +368,107 @@ def t10_oversized_body(r, declared=64 * 1024 * 1024, wait=2.0):
     r.check('之后服务器仍能正常服务', ok, detail)
 
 
+def _check_body_waited(r, header_line, label):
+    """发一个"声明了 body"的请求，但**先只发一部分 body**。
+
+    为什么必须这样测？因为解析失败的**症状不是报错，而是提前响应**：
+      - 正确：识别出 Content-Length → 等 body 收齐 → 补齐后返回 200
+      - 错误：没识别出 Content-Length（当成 0）→ 头一发完就回 200，body 被丢弃
+    只看"最终返回 200"是抓不住 bug 的 —— 两种行为都会返回 200。
+    """
+    body = b'hello'
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    try:
+        s.sendall(b'POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\n' +
+                  header_line + b'\r\nConnection: close\r\n\r\n' + body[:2])
+        s.settimeout(1.0)
+        early = b''
+        try:
+            early = s.recv(4096)
+        except socket.timeout:
+            pass                       # 超时 = 服务器在等 body（正确）
+        except ConnectionError:
+            pass
+        r.check('%s：body 没到齐时服务器不提前响应' % label, early == b'',
+                '服务器提前响应了：%r  ← 说明它没认出 Content-Length' % early[:40])
+
+        s.sendall(body[2:])            # 补齐 body
+        s.settimeout(3.0)
+        data = b''
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except (socket.timeout, ConnectionError):
+                break
+            if not chunk:
+                break
+            data += chunk
+        status, _, _ = parse(data)
+        r.check('%s：补齐 body 后返回 200' % label, status == 200, '实际=%s' % status)
+    finally:
+        s.close()
+
+
+def t11_lowercase_content_length(r):
+    """头字段名【大小写不敏感】（RFC 9110 §5.1: Field names are case-insensitive）。
+
+    修复前：read_buffer.find("Content-Length: ") 精确匹配 → 小写形式找不到
+            → content_len 当成 0 → 头读完就响应，body 被丢弃。
+    """
+    print('\n[11] 小写头字段名：content-length（协议规定大小写不敏感）')
+    _check_body_waited(r, b'content-length: 5', '小写 content-length')
+
+
+def t12_content_length_no_space(r):
+    """冒号后的空白是【可选】的（RFC 9112 §5: field-name ":" OWS field-value）。
+
+    修复前：find("Content-Length: ") 要求冒号后恰好一个空格 → "Content-Length:5" 找不到。
+    """
+    print('\n[12] 无空格头字段：Content-Length:5（冒号后直接跟值）')
+    _check_body_waited(r, b'Content-Length:5', '无空格写法')
+
+
+def t13_content_length_junk(r):
+    """Content-Length 的值必须是纯数字 —— 非法值必须被拒绝。
+
+    修复前：std::stoul("10abc") 会返回 10（解析到非数字就停），非法值被当成合法值。
+    RFC 9112 §6.3 要求：无效的 Content-Length 必须以 400 拒绝（或直接断开）。
+    """
+    print('\n[13] 非法值：Content-Length: 10abc（不能只取前面的数字）')
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    closed = False
+    data = b''
+    try:
+        s.sendall(b'POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                  b'Content-Length: 10abc\r\nConnection: close\r\n\r\n5hello')
+        s.settimeout(2.0)
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            except ConnectionError:
+                closed = True
+                break
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+    finally:
+        s.close()
+
+    status, _, _ = parse(data)
+    if closed:
+        r.info('服务器的处理方式', '断开了连接（正确）')
+        r.check('非法 Content-Length 被拒绝', True)
+    elif status is not None and 400 <= status < 500:
+        r.info('服务器的处理方式', '返回了 %s' % status)
+        r.check('非法 Content-Length 被拒绝', True)
+    else:
+        r.check('非法 Content-Length 被拒绝', False,
+                '服务器回了 %s —— 说明 "10abc" 被当成了合法值' % status)
+
+
 # ----------------------------------------------------------------------
 def main():
     global HOST, PORT
@@ -402,6 +503,9 @@ def main():
     t8_post_with_body(r)
     t9_body_split_no_early_response(r)
     t10_oversized_body(r)
+    t11_lowercase_content_length(r)
+    t12_content_length_no_space(r)
+    t13_content_length_junk(r)
 
     print('\n' + '=' * 64)
     print(' 结果：通过 %d 项，失败 %d 项' % (r.passed, r.failed))

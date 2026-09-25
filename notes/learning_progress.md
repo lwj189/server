@@ -11,11 +11,13 @@
 ## 当前位置
 
 ```
-day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5（加固）🚧 → day3 半包 ⬜ → day4 epoll ⬜
+day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5a ✅ → CP5b ✅ → day4（epoll）⬜
 ```
 
 练习文件：`p2.cpp`（自己手写，不抄 day2.cpp）
-手写代码已经跑通：`curl -v http://127.0.0.1:8888/` 返回完整的 200 响应。
+自动化验收：`tests/p2_test.py` —— **18 项检查，当前全绿**
+
+一句话现状：**手写的 `p2.cpp` 已经是一个能扛住各种异常客户端、功能上超过 `day2.cpp` 的可运行 HTTP 服务器。**
 
 ---
 
@@ -107,13 +109,57 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
 - [x] `send(conn_fd, response.c_str(), response.size(), 0)`（第一个参数是**分机** `conn_fd`）
 - [x] `if (sent < 0) { perror("send"); }`
 
-### 🚧 CP5：加固（进行中）
+### ✅ CP5a：半包处理（按连接读缓冲区）+ 请求头大小上限
 
-- [ ] 把响应整段挪进 `if (n > 0)`（没收到请求就不该回响应）
-- [ ] 加 `#include <csignal>` + `signal(SIGPIPE, SIG_IGN);`
-- [ ] 用"临时连发两次 send"的实验验证 SIGPIPE（测完删掉实验代码）
-- [ ] 编译零错误零警告
-- [ ] 跑两个异常客户端：连上就关 / RST 强断 → 服务器仍然活着
+**目标**：不论客户端怎么切分发送，都要收到**完整的请求头**再响应。
+
+**验收证据**（`tests/p2_test.py` 的 [5] [6] [7]）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 分两段发送（间隔 0.5s） | 200 ✅ |
+| **逐字节发送**（每字节间隔 5ms） | 200 ✅ |
+| 发 16KB 垃圾、永远不发 `\r\n\r\n` | 服务器**主动断开** ✅ |
+
+- [x] 删掉"单次 read + `if (n > 0)`"那套旧结构，改成循环读
+- [x] `std::string read_buffer;` 声明在 `while (true)` **里面**（每个连接一份）
+- [x] `read_buffer.append(chunk, n);` 把每次读到的追加进去
+- [x] 判据用 `read_buffer.find("\r\n\r\n")`（来自 RFC 9112 §2.1 的 ABNF）
+- [x] `constexpr size_t MAX_HEADER_SIZE = 8 * 1024;` 防 DoS
+- [x] 超限检查放在"找判据**之后**"（收全了就不算超限）
+
+**内存实测**（DoS 保护真的生效）：
+
+```
+发 10MB 垃圾前 RSS =  3948 KB
+发 10MB 垃圾后 RSS =  4040 KB   ← 基本没变；修复前是 4136 → 14508 KB
+```
+
+### ✅ CP5b：按 Content-Length 收全 body + body 大小上限
+
+**核心认知：头部完整 ≠ 请求完整。**
+
+```
+一个 HTTP 消息 = 头部（分隔符定界 \r\n\r\n） + body（长度前缀定界 Content-Length）
+```
+
+**验收证据**（`tests/p2_test.py` 的 [8] [9] [10]）：
+
+| 场景 | 结果 |
+| --- | --- |
+| POST + 完整 body 一次送达 | 200 ✅ |
+| **body 分两段：先发 5/10 字节** | 服务器**不提前响应** ✅；补齐后 200 ✅ |
+| `Content-Length: 67108864`（64MB）但不发 body | 被拒/断开 ✅ |
+| `Content-Length: abc`（非法值） | 服务器**活着** ✅（try/catch 生效）|
+| `curl -X POST -d 'name=Bob&age=25'` | 日志里能看到**完整 body** ✅ |
+
+- [x] `header_end = read_buffer.find("\r\n\r\n")`
+- [x] 解析 `Content-Length`：`cl_pos < header_end` 保证它是在**头部里**找到的
+- [x] `total = header_end + 4 + content_len`
+- [x] **`while (read_buffer.size() < total)` 继续读**（这是 CP5b 的关键）
+- [x] `std::stoul` 用 `try / catch` 包住（否则非法值会让整个进程 terminate）
+- [x] body 大小上限检查
+- [x] 用 `read_buffer.size() >= total` 判断（**不能**假设"再 read 一次 body 就齐了"）
 
 ---
 
@@ -162,6 +208,7 @@ ERRORS        ④ 决定失败后重试/退出/忽略
 
 报 `'sockaddr_in' was not declared` → 回 man 的 SYNOPSIS 抄 include，不背 include 表。
 报 `'response' was not declared` → 检查**作用域**。
+报 `expected '}' at end of input` → 括号层级错乱（改代码时最常见）。
 
 ### 7. 改源码 → 保存 → 重新编译
 
@@ -179,6 +226,16 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - **总机 / 分机**：`server_fd` 一直监听，`conn_fd` 是一条连接
 - **host ↔ network**：填进去用 `hton*`，读出来用 `ntoh*`
 - **字节流**：TCP 没有消息边界，一次 read ≠ 一个请求
+
+### 9. 设计题的三问模板（CP5 学到的）
+
+前面几步都是"查询题"（手册里有答案）；CP5 开始是"**设计题**"（手册只给零件）。三问：
+
+1. **问题是什么？**（现象 → 约束）　例：一次 read 不够 → 要循环 + 要缓冲
+2. **规范里"完整/正确"的定义是什么？**（RFC / 协议）　例：RFC 9112 §2.1 → `\r\n\r\n`
+3. **我手上有什么零件？**（API 能力）　例：`read` + `std::string::append/find`
+
+三样拼起来就是骨架。**骨架不是"标准答案"，是"一个合理选择"**——要能说出"我为什么这么设计"。
 
 ---
 
@@ -214,13 +271,15 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 
 - `errno` 机制：失败返回 -1 并设置 `errno`；ERRORS 是"故障字典"
 - 三类错误：可重试（`EINTR`）/ 可恢复（`EMFILE`）/ 编程错误（`EINVAL`）
-- `perror` 打印 `strerror(errno)`
+- `perror` 打印 `strerror(errno)`；**只能紧跟在失败的系统调用之后**，隔几行再 perror 打的是**过期的 errno**（会打印 `read: Success` 这种垃圾）
+- `std::stoul` 会抛异常（`"abc"` / 空串 / 超大数 / 负数回绕）→ 不 catch 就是 `std::terminate`
 
 **进程与 fd**
 
 - fd 是进程内的**小整数**（0/1/2 被 stdio 占了，所以第一个是 3）
 - **close 后 fd 号立刻会被复用**（实测：连两次都是 fd=4）→ day5 use-after-close 竞态根源
 - `server_fd`（总机，LISTEN，全程不关）vs `conn_fd`（分机，一条连接，用完就关）
+- ⚠️ 在 `while (true)` 里用 `continue` 时，**必须先 `close(conn_fd)`**，否则跳过底部的 close → fd 泄漏
 
 **作用域**
 
@@ -243,11 +302,21 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - `Content-Length` 必须是**字节数**且与实际 body 一致
 - `Connection: close` 是显式声明关闭；HTTP/1.1 **默认 keep-alive**
 - "HTTP 无状态" ≠ "短连接"（无状态指不记得上一个请求，所以要 Cookie）
+- 一个完整请求 = **头部（分隔符定界）** + **body（长度前缀定界）** ← CP5b
+
+**消息定界（CP5 的核心）**
+
+- TCP 是字节流，**没有消息边界**，定界方式只有三种：定长 / **分隔符** / **长度前缀**
+- HTTP 很特别：头部用**分隔符**（`\r\n\r\n`），body 用**长度前缀**（`Content-Length`）
+- **半包**：一次 read **不够**一个消息 → 循环**读**、攒够
+- **粘包**：一次 read **超过**一个消息 → 循环**解析**、`erase` 消费掉已处理的字节
+- 两者共用同一套基础设施：**每连接缓冲区 + 解析循环**
+- 缓冲区属于**连接的状态**，必须和连接同生共死（声明在 `while (true)` 里）
+- **当前实现用"一个连接只处理一个请求"规避了粘包**（响应完就 `close`，多余字节丢弃）——代价是没有 keep-alive
 
 **内核行为**
 
 - TIME_WAIT：主动关闭方等 2MSL（Linux 约 60 秒），期间占用本地端口
-- TCP 是**字节流**，没有消息边界 → 一次 `read` ≠ 一个请求（半包/粘包）
 - 阻塞式 `read` + 单线程 → **一个不发数据的客户端就能卡死整个服务器**
 
 ---
@@ -266,19 +335,38 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 
 `pitfalls.md` 里还有：**症状速查表**（看到报错直接查编号）、**常用命令小抄**、**SIGPIPE 专题**。
 
+**CP5 阶段新撞的、还没归档的坑**（下次更新 `pitfalls.md` 时补进去）：
+
+| # | 现象 | 根因 |
+| --- | --- | --- |
+| E2 | `'response' was not declared in this scope` | 把声明挪进 `if` 块，但 `send` 还留在块外 → **作用域** |
+| E3 | `expected '}' at end of input` | 改动时括号层级错乱（`if (header_done)` 的 `}` 用掉了 main 的） |
+| D8 | 请求头收全了就以为"请求收全了" | **头部完整 ≠ 请求完整**，还要按 `Content-Length` 收 body |
+| D9 | 发 10MB 垃圾 → 服务器 RSS 从 4MB 涨到 14MB | 没有 `MAX_HEADER_SIZE`，`read_buffer` 无限增长 |
+| D10 | `Content-Length: abc` 让整个进程消失 | `std::stoul` 抛异常没人 catch → `std::terminate` |
+| D11 | 两个请求一次发，只回了一个响应 | **粘包**：`\r\n\r\n` 只匹配到第一个请求，多余的被 `close` 丢弃 |
+| E4 | `else { perror("read"); }` 打印 `read: Success` | 隔了逻辑分支再 `perror` → 打印**过期的 errno** |
+| E5 | body 上限复用了 `MAX_HEADER_SIZE` | 头/体是两个约束，共用一个常量会误杀合法请求（8KB body 太小）|
+
 ---
 
 ## 五、接下来做什么
 
-- [ ] **CP5 收尾**：响应挪进 `if (n > 0)`、加 SIGPIPE 忽略、验证异常客户端杀不掉服务器
-- [ ] **回到 `day3.cpp`**：学正规的半包解法 —— 按连接读缓冲区 + `Content-Length` + **长度上限防 DoS**
-- [ ] `day4.cpp`：非阻塞 IO + `epoll`（解决"一个慢客户端卡死全服"）
+- [x] **CP5a**：半包（按连接读缓冲区）+ 请求头大小上限
+- [x] **CP5b**：按 `Content-Length` 收全 body + body 大小上限
+- [ ] **小修**：把 body 上限拆成独立的 `MAX_BODY_SIZE`（1MB，和 day2.cpp 一致）；`clang-format -i p2.cpp`
+- [ ] **可选**：`Content-Length` 大小写不敏感（RFC 9110 §5.1，现在小写识别不了）
+- [ ] **`day4.cpp`：非阻塞 IO + `epoll`** ← **下一步，解决"一个慢客户端卡死全服"**
 - [ ] `day5.cpp`：`epoll` + 线程池（单 Reactor）；注意 fd 所有权交接的竞态
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
+- [ ] **粘包 / keep-alive**：等 epoll 上来之后再做（配套：`read_buffer.erase` 消费已处理字节、响应头按请求决定、idle 超时）
+
+> 为什么 keep-alive 排在 epoll 后面：阻塞模型下一个 keep-alive 连接会**永久占住**唯一的服务线程，反而放大弱点。
 
 ### 自检问题（能答上来才算真会）
 
 **CP2（accept）**
+
 1. 为什么 `accept` 第一个参数是 `server_fd`？
 2. `conn_fd` 和 `server_fd` 有什么区别？谁先关、谁后关？
 3. `client_len` 为什么每次都要重置？
@@ -297,3 +385,24 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 10. `send` 第一个参数传谁？为什么不是 `server_fd`？
 11. `send` 的返回值为什么可能**小于**你要求的长度？
 12. SIGPIPE 是什么？为什么服务器要忽略它？不忽略会怎样？
+
+**CP5a（半包）**
+
+13. `read_buffer` 为什么必须声明在 `while (true)` **里面**？放外面会出什么事？
+14. 判据为什么是 `\r\n\r\n` 而不是 `\n\n`？这个判据是从哪份规范的哪一节来的？
+15. 超限检查为什么必须放在"找判据**之后**"？
+16. 客户端一直发数据、永远不发判据，会发生什么？你怎么防？
+
+**CP5b（body）**
+
+17. 为什么"头部收全了"不等于"请求收全了"？
+18. 一个完整请求的总字节数怎么算？（`header_end` / `+4` / `content_len` 各是什么）
+19. 为什么用 `read_buffer.size() >= total` 判断，而不是"再 read 一次 body 就到齐了"？
+20. `std::stoul` 遇到 `Content-Length: abc` 会怎样？不加 try/catch 的后果是什么？
+21. 在 `while (true)` 里用 `continue` 之前，必须先做什么？为什么？
+
+**HTTP / 定界**
+
+22. 半包和粘包是同一个问题的两面吗？它们各自需要什么手段？
+23. 你现在是用什么方式"规避"粘包的？代价是什么？
+24. 要真正支持 keep-alive，需要改哪三处？（提示：循环解析、消费缓冲区、按请求决定关闭）

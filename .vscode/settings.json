@@ -1,5 +1,37 @@
 {
+  // ==================== 文件与保存 ====================
   "files.autoSave": "onFocusChange",
+  "files.trimTrailingWhitespace": true, // 保存时自动删行尾空格
+  "files.insertFinalNewline": true,
+
+  // ==================== 缩进 ====================
+  // detectIndentation 关掉：否则打开一个别人写的 2 空格文件，
+  // VSCode 会把后续缩进也改成 2 空格，越写越乱
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.detectIndentation": false,
+  "editor.autoIndent": "full", // 换行时自动跟上缩进
+
+  // ==================== 看代码的辅助线（解决"花括号一多就乱"）====================
+  "editor.guides.indentation": true, // ★ 缩进参考线：把层数画成竖线
+  "editor.guides.bracketPairs": true, // ★ 括号配对连线
+  "editor.bracketPairColorization.enabled": true, // 配对括号上色
+  "editor.renderWhitespace": "boundary", // 把行尾/行首的多余空白显示出来
+
+  // ==================== 保存时自动格式化 ====================
+  // C/C++ 扩展自带 clang-format，会读取项目根目录的 .clang-format
+  "C_Cpp.formatting": "clangFormat",
+  "C_Cpp.clang_format_style": "file", // "file" = 用工作区里的 .clang-format
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true
+  },
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true
+  },
+
+  // ==================== git ====================
   "git.autofetch": true,
   "git.confirmSync": false
 }

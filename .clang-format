@@ -28,13 +28,30 @@ PointerAlignment: Left
 
 # ---- 保留紧凑的单行写法 ----
 AllowShortBlocksOnASingleLine: Always
-AllowShortIfStatementsOnASingleLine: Always
+# ⚠️ 合法值只有 Never / WithoutElse / OnlyFirstIf / AllIfsAndElse。
+#    写 Always 是无效值，会被当成 OnlyFirstIf —— 反而把 if (x) { a; b; } 拆成 5 行。
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
 AllowShortFunctionsOnASingleLine: All
+# 保留 while (cond) ++v; 这种紧凑写法（默认 false 会把它拆成两行）
+AllowShortLoopsOnASingleLine: true
+
+# ---- 行尾注释前留 3 个空格 ----
+# 默认是 1，会把手写的 "code;   // 注释" 压成 "code; // 注释"。
+# 对齐行为由 AlignTrailingComments 管（LLVM 默认已开）。
+SpacesBeforeTrailingComments: 3
 
 # ---- 不自动折行 ----
 # clang-format 按"列"算宽度，中文一个字算好几列，会把中文注释从中间切断。
 # 所以直接关掉列宽限制。
 ColumnLimit: 0
 
-# ---- 连续空行最多保留 2 行 ----
-MaxEmptyLinesToKeep: 2
+# ---- 连续空行最多保留 1 行 ----
+# 空行 = 段落分隔。函数体内超过 1 个空行只会让"段落"变模糊；
+# 顶层区域之间（include 区 / 常量区 / 函数区）1 行也够用。
+MaxEmptyLinesToKeep: 1
+
+# ---- 函数/类定义之间自动空 1 行 ----
+# 这条帮你自动维护"函数之间永远空 1 行"这条规则，不用自己记。
+# （Leave = 保持原样；Never = 全删；Always = 强制加一行）
+SeparateDefinitionBlocks: Always
+

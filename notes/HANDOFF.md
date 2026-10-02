@@ -66,7 +66,7 @@ kill %1
 ├── epoll.cpp           ← day4 练习（CP6a ✅ 事件循环 / CP6b ✅ 分机纳入 epoll）
 ├── README.md
 ├── .clang-format       ← 代码风格（4 空格缩进 / Attach 括号 / 指针贴左 / 不折行）
-├── .github/workflows/ci.yml ← CI：严格编译 p2 + 跑 p2_test.py（⚠ epoll 还没进去）
+├── .github/workflows/ci.yml ← CI：严格编译 p2+epoll，再【串行】跑两套测试（23 项 + 4 项）
 ├── notes/
 │   ├── HANDOFF.md          ← 本文件
 │   ├── learning_progress.md ← 学习进度、概念清单、坑表格、命令小抄
@@ -87,8 +87,13 @@ kill %1
 跑哪个测试取决于你起的是哪个服务器（起 `./epoll` 却跑 `p2_test.py` 会一片红）。
 
 **git**：分支 `main` + `cp5-halfpacket`，已推到 origin。
-**最新提交**：`e468ac9 day4 CP6a: epoll 事件循环跑通 + 格式化工具链`
-（CP6b 的代码 + `cp6b_test.py` 目前**还没提交**）
+**写这份时的最新提交**：CP6b（分机纳入 epoll + fd 配平）—— 哈希跑 `git log --oneline -1` 看。
+
+⚠ **命令行推不了**：本机没有 git 凭证（无 `credential.helper`、无 `~/.git-credentials`、
+无 token、`gh` 未登录），`git push` 会报
+`could not read Username for 'https://github.com'`。
+→ 用 **VS Code 的"同步更改"按钮**推（凭证存在 VS Code 的 GitHub 会话里）。
+→ 验证：`git fetch origin && git log --oneline origin/main -1`
 
 ---
 

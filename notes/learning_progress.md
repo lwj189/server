@@ -218,7 +218,49 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
 - [x] `accept` **循环到 `EAGAIN/EWOULDBLOCK`**（一次事件可能对应队列里多个新连接）
 - [x] 踩过"少一个 `}` → 整段事件循环变成死代码"（已修，注释里留了警告）
 
-**还没做的**：client fd 还没纳入 epoll → CP6b。
+**还没做的**：~~client fd 还没纳入 epoll → CP6b~~（CP6b 已完成，见下）
+
+### ✅ CP6b：把分机（`conn_fd`）纳入 epoll
+
+**目标**：让 `accept` 出来的 `conn_fd` 也进事件循环 —— 一个线程**真正**同时持有 N 条连接。
+
+**三个动作**：
+
+1. **`conn_fd` 设非阻塞**（和 `server_fd` 同形的"读-改-写"三步）
+   ⚠ `accept` 出来的 socket **不继承** `server_fd` 的非阻塞（`man 2 accept` 明说，且注明与 BSD 不同）
+2. **登记**：`epoll_ctl(EPOLL_CTL_ADD)`，`cev.events = EPOLLIN`、`cev.data.fd = conn_fd`
+3. **分流 + 读循环**：`events[i].data.fd == server_fd` → 总机（`accept`）；否则 → 分机（`read`）
+   `read` 循环到 `EAGAIN`；`read()==0`（对端正常关闭）或出错时 `close` 配平
+
+**验收证据（实测）**：
+
+```
+① 编译：-Wall -Wextra -Wformat=2 -Wconversion → 退出码 0，零警告
+
+② tests/cp6b_test.py → 4/4 全绿
+   [1] echo   [2] 分多次到达   [3] 并发不串台   [4] fd 配平
+
+③ 连跑 3 次（服务器不重启），基线【始终是 5】
+   累计 78 条连接进出，fd 数从头到尾没动过
+   日志里 fd=5 反复出现 ← 关闭后号码被内核回收复用
+```
+
+**关键决定**：`read()==0` 时**只 `close`，不 `EPOLL_CTL_DEL`**（理由见第三节 epoll 段）。
+
+**★ 假绿教训（这条比代码值钱）**：
+
+HANDOFF §7 原来的验收是"3 个 nc 都不关、该打印 fd 5/6/7"。
+实测发现：CP6a 那份 `close(conn_fd)` 被注释掉的代码**同样打印 5/6/7**（fd 全泄漏）。
+
+| | 泄漏版（CP6a） | 配平版（CP6b） |
+| --- | --- | --- |
+| 3 个 nc 同时开 | 打印 5、6、7 ✅ | 打印 5、6、7 ✅ |
+| 跑 20 条连接后 | fd 11 → 31 | fd 5 → 5 |
+| 跑 78 条连接后 | fd 只涨不落 | fd **还是 5** |
+
+→ **验收标准本身也要被验证：要问"反例能不能通过"。**
+
+**还没做的**（CP6d）：同批陈旧事件 / `EMFILE` 忙等 / 部分写。
 
 ---
 
@@ -244,10 +286,43 @@ ERRORS        ④ 决定失败后重试/退出/忽略
 | --- | --- |
 | 系统调用 | `man 2 名字` |
 | C 库函数（含 `htons`） | `man 3 名字`（`htons` → `man 3 byteorder`） |
-| 结构体/类型 | `man 3type 名字`（`sockaddr_in`） |
+| 结构体/类型 | `man 3type 名字`（`sockaddr_in`、`epoll_event`） |
+| **命令 / 常量的子项** | **`man 2const 名字`**（`F_GETFL`、`F_SETFL`）⚠ 见下 |
 | 协议/常量/特殊值 | `man 7 协议`（`INADDR_ANY` → `man 7 ip`） |
 | 不知道页名 | `man -k 关键词`（看节号 + 描述筛选） |
 | 都不确定 | `grep -rn '名字' /usr/include/`（终极兜底） |
+
+⚠ **新版 man-pages（6.x）会拆页** —— 这个坑真踩过：
+
+找 `F_GETFL` 时打开 `man 2 fcntl`，**里面只有路标**（第 32~33 行）：
+
+```
+F_GETFL(2const)
+F_SETFL(2const)
+```
+
+正文被拆成了独立页，得这么查：
+
+```bash
+man 2const F_GETFL      # 一页同时讲 F_GETFL 和 F_SETFL
+man 2const F_SETFL
+```
+
+但反过来也有例外：**`EPOLLIN` 没有独立页**，它就写在 `man 2 epoll_ctl` 的 DESCRIPTION 里。
+
+⚠ **`man -k` 只搜手册的 NAME 那一行**，搜不到正文里的词：
+
+```bash
+man -k EPOLLIN                # 什么都没有 ← 不代表手册里没写
+man -k F_GETFL                # F_GETFL (2const) - get/set file status flags  ← 有
+man -k "file status flags"    # 也能搜到（它搜的是描述行）
+```
+
+要搜**正文**得自己过一遍（`col -b` 去掉退格控制符，不然输出里全是 `^H`）：
+
+```bash
+man 2 epoll_ctl | col -b | grep -n -A3 EPOLLIN
+```
 
 ### 4. 三档过滤法（看不懂的内容怎么办）
 
@@ -296,6 +371,29 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 
 三样拼起来就是骨架。**骨架不是"标准答案"，是"一个合理选择"**——要能说出"我为什么这么设计"。
 
+### 10. 读英文手册的句型表
+
+手册的英文**高度模板化**，翻来覆去就这十几个句型。认熟它们，读起来会快很多。
+
+| 英文 | 人话 |
+| --- | --- |
+| `On success, X is returned` | 成功时返回 X |
+| `On error, -1 is returned, and errno is set to indicate the error` | 失败返回 -1，`errno` 说明原因 |
+| `The associated file` | **你传进来的那个 fd**（手册不直说 "the fd you passed"） |
+| `is available for read(2) operations` | 现在可以 `read` |
+| `... only after ...` | 只有在……之后才…… |
+| **`The following values may be specified`** | ★ 可以指定**下面这些值** → 后面就是取值清单，直接拿去填参数 |
+| `is composed by ORing together ...` | 用 `\|` 把若干项拼起来 |
+| `does not inherit` | **不继承** → 意思是"你得自己设一遍" |
+| `It is not necessary to ...` | **不必要** → 意思是"这一步可以省掉" |
+| `may` / `might` | **可能**（不保证，别依赖它） |
+| `shall` / `must` | **必须** |
+| `should` | **建议**（不强制） |
+
+**括号里的 `(2)` / `(3type)` / `(7)` / `(2const)` 是手册分节，不是版本号。**
+
+配合 #4 三档过滤法一起用：某句看不懂时先问一句 —— **"它会改变我这一行代码吗？"** 不会就跳过。
+
 ---
 
 ## 三、已掌握的概念清单
@@ -339,6 +437,11 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - **close 后 fd 号立刻会被复用**（实测：连两次都是 fd=4）→ day5 use-after-close 竞态根源
 - `server_fd`（总机，LISTEN，全程不关）vs `conn_fd`（分机，一条连接，用完就关）
 - ⚠️ 在 `while (true)` 里用 `continue` 时，**必须先 `close(conn_fd)`**，否则跳过底部的 close → fd 泄漏
+- **配平**：`accept` 是"**借**"一个 fd，每条路径都要 `close` "**还**"回去 —— 借 N 还 N，账才是平的
+  （实测：泄漏版跑 20 条连接，fd 从 11 涨到 31；配平版跑 **78 条连接，fd 始终是 5**）
+- fd 上限是 `ulimit -n`（本机 524288，**但真实服务器 / 容器里常常只有 1024**）
+  → 泄漏是**累积**的，跑久了才炸，所以特别难发现
+- 借了不还的后果：`accept` 开始返回 `EMFILE`（`Too many open files`），服务器再也接不了新客人
 
 **作用域**
 
@@ -378,7 +481,7 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - TIME_WAIT：主动关闭方等 2MSL（Linux 约 60 秒），期间占用本地端口
 - 阻塞式 `read` + 单线程 → **一个不发数据的客户端就能卡死整个服务器**
 
-**epoll / 事件驱动（CP6a）**
+**epoll / 事件驱动（CP6a / CP6b）**
 
 - **思想转变**：从"我主动去读、没数据就等着" → "**先把连接登记给内核、内核告诉我谁就绪**"（Reactor）
 - `fcntl(fd, F_GETFL, 0)` 里那个 `0` 是**占位符**（`man 2const F_GETFL` 原文：*"arg is ignored"*）
@@ -392,6 +495,32 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - `sizeof(struct epoll_event) == 12`（因为 `__EPOLL_PACKED`；不加会因对齐补到 16）
 - **一次事件可能对应多个就绪 fd，也可能对应一个 fd 的多批数据** → `accept` 和 `read` 都要**循环到 `EAGAIN`**
 - `EPOLLRDHUP`：对端 half-close 的通知，判断断开比 `EPOLLIN` 更早更准
+
+**CP6b 补充（把分机纳入 epoll）**
+
+- **`EPOLLIN` 是同一个位，含义由 socket 的种类决定** —— 这是最大的卡点：
+  - 监听 socket 上：**有新连接在排队** → 该 `accept`
+  - 连接 socket 上：**有数据可读，或者对端关闭了** → 该 `read`
+- **"订阅的 `events`" 和 "回来的 `events`" 是两个方向**：登记时写的是"我关心什么"，
+  `epoll_wait` 回来的是"实际发生了什么"。
+  实测：**新连接 / 有数据 / 对端发 FIN 三种情况，回来的位掩码都是 `0x01`（EPOLLIN）**
+  → 光看 `events` 分不清这三种，所以**分流必须靠 `data.fd`**
+- **EOF 是以"可读"的形式通知你的**：对端发 FIN 后这个 fd 变成可读，`read()` 返回 `0`。
+  所以 `read()==0` 不是"读到 0 字节"，而是"**对端正常关闭了**"
+  （`man 2 read`：*zero indicates end of file*）
+- **`read()==0` 时只 `close`，不 `EPOLL_CTL_DEL`**：`man 7 epoll` 的 Q&A 明说 ——
+  fd 关闭时会**自动**从所有 interest list 摘除。显式 DEL 反而有风险：
+  fd 号可能已被新连接复用，会误删**别人**的登记
+- `accept` 出来的 socket **不继承** `server_fd` 的 `O_NONBLOCK`（`man 2 accept` 明说，与 BSD 不同）
+  → 所以每条连接都得自己设一遍，这一步不是多余的
+- 想看内核里的**登记表**：`cat /proc/<pid>/fdinfo/<epoll_fd>`
+  （`tfd:` 是目标 fd，`data:` 就是你写进去的标记；
+  还能看到内核自动 OR 上的 `EPOLLERR|EPOLLHUP` —— 所以显示的是 `events: 19` 而不是 `1`）
+- 对端 **RST 强断**时回来的位掩码是 `0x19`（`EPOLLIN|EPOLLERR|EPOLLHUP`）——
+  `EPOLLERR` / `EPOLLHUP` **没订阅也会报**（`man 2 epoll_ctl`：*always report … not necessary to set*）
+- **`EMFILE` 忙等（CP6d 要处理）**：`accept` 返回 `EMFILE` 后如果只是 `break`，
+  LT 模式下监听 fd 仍然"可读" → `epoll_wait` 立刻又返回 → **死循环烧 CPU**。
+  实测把 ulimit 压到 64：59 条连接就撞墙，几秒钟写了 **21797 行** `accept: Too many open files`
 
 ---
 

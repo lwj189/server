@@ -9,6 +9,7 @@ a.out
 p2
 p3
 p4
+epoll
 
 # CI / 测试产生的日志
 build.log

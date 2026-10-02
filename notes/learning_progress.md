@@ -4,20 +4,24 @@
 >
 > **这份文件只负责三件事**：我在哪（进度）、我会了什么（方法论 + 概念清单）、接下来做什么（路线）。
 >
-> 另外两份笔记各管一摊，避免重复维护：
+> 另外几份笔记各管一摊，避免重复维护：
 > - **撞过的坑** → `pitfalls.md`
+> - **epoll 的 API + 概念 + 速查表** → `epoll_notes.md`
+> - **给"新对话"的交接文档**（工作方式 / 项目地图 / 心智模型）→ `HANDOFF.md`
 > - **day2 逐行讲解 + 手册怎么查** → `../../serverai/day2_walkthrough.md`（AI 参考实现一起放在仓库外的 `serverai/`）
 
 ## 当前位置
 
 ```
-day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5a ✅ → CP5b ✅ → day4（epoll）⬜
+day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5a ✅ → CP5b ✅
+        → 修 3 个解析问题 ✅ → day4：CP6a ✅ → CP6b ⬜ ← 下一步
 ```
 
-练习文件：`p2.cpp`（自己手写，不抄 day2.cpp）
-自动化验收：`tests/p2_test.py` —— **18 项检查，当前全绿**
+练习文件：`p2.cpp`（自己手写，**阻塞版**，CP1~CP5）
+　　　　　`epoll.cpp`（**day4 练习**，CP6a 完成，还没接管客户端）
+自动化验收：`tests/p2_test.py` —— **13 个用例 / 23 项检查，当前全绿**
 
-一句话现状：**手写的 `p2.cpp` 已经是一个能扛住各种异常客户端、功能上超过 `day2.cpp` 的可运行 HTTP 服务器。**
+一句话现状：**`p2.cpp` 是一个能扛住各种异常客户端的 HTTP 服务器（阻塞式，一次一条连接）；`epoll.cpp` 刚跑通事件循环（空闲时睡在 `ep_poll` 里、0% CPU），但客户端 fd 还没纳进来。**
 
 ---
 
@@ -160,6 +164,61 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
 - [x] `std::stoul` 用 `try / catch` 包住（否则非法值会让整个进程 terminate）
 - [x] body 大小上限检查
 - [x] 用 `read_buffer.size() >= total` 判断（**不能**假设"再 read 一次 body 就齐了"）
+
+### ✅ 修 3 个解析问题（大小写 / OWS / 非法值）
+
+**性质**：这三个都是"**能编译、能跑、还返回 200**，但解析结果是错的"类型 —— 不写测试根本发现不了。
+
+| 问题 | 旧实现 | 新实现 | 依据 |
+| --- | --- | --- | --- |
+| 头字段名**大小写敏感** | `find("Content-Length: ")` | `toLowerAscii(...) == "content-length"` | RFC 9110 §5.1 *"Field names are case-insensitive"* |
+| 冒号后**必须有空格** | 写死一个空格 | 跳过 OWS（0 个或多个空格/制表符） | RFC 9112 §5 `field-line = field-name ":" OWS field-value OWS` |
+| 值可以是 `10abc` | `stoul` 遇非数字就停 → 返回 10 | `isAllDigits` 先卡纯数字，`stoull` 只负责溢出保护 | RFC 9112 §6.3 要求无效的 Content-Length 必须拒绝 |
+
+**新增的三个纯函数**：`toLowerAscii` / `findHeader` / `isAllDigits`（源码注释里逐条写了语法点：`static` 的内部链接、`const &` 只读参数、输出参数惯用法、范围 for 的 `&`、`static_cast<unsigned char>` 为什么必要）
+
+**验收（TDD 红→绿）**：
+
+```
+修复前（只把 Content-Length 那一段还原）：t11/t12/t13 全红，5 项失败
+   服务器提前响应了 b'HTTP/1.1 200 OK...'   ← 说明它没认出 Content-Length
+   服务器回了 None —— 说明 "10abc" 被当成了合法值
+
+修复后：通过 23 项，失败 0 项
+```
+
+**测试设计的教训（值得记住）**：解析失败的**症状不是报错，而是"提前响应"**。
+所以 t11/t12 必须"**先只发一半 body、停 1 秒、看服务器有没有抢跑**" ——
+只看"最终返回 200"是抓不住 bug 的，因为**正确和错误两种行为都会返回 200**。
+
+### ✅ CP6a：epoll 事件循环（`epoll.cpp`）
+
+**目标**：把"阻塞单连接"改成"**1 个线程照看 N 个连接**"。先只搭事件循环，**不接 HTTP 解析**。
+
+**为什么先不接解析**：epoll 回答"哪个 fd 有事件"（IO 层），HTTP 解析回答"这堆字节里哪一段是完整请求"（应用层）—— **两者正交**。一次只引入一个新变量，否则出 bug 时分不清是哪一层错了。
+
+**验收证据（实测）**：
+
+```
+① 编译：g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion → 退出码 0
+
+② 空闲时：  PID  STAT  %CPU  WCHAN      CMD
+             11   S     0.0   ep_poll    ./e
+                            ↑ 线程睡在内核的 ep_poll 里，0% CPU
+
+③ 同时来 3 个连接 → 一次事件全部接到（accept 循环到 EAGAIN 生效）
+   新连接 fd=5 / fd=5 / fd=5    ← 都是 5，因为立刻 close 了（fd 复用）
+```
+
+- [x] `server_fd` 设非阻塞：`fcntl(F_GETFL, 0)` 读 → `F_SETFL | O_NONBLOCK` 写（**读-改-写三步**）
+- [x] `epoll_create1(0)` 创建 epoll 实例（**它本身也是一个 fd**）
+- [x] `epoll_ctl(ADD, server_fd, &ev)`：`ev.events = EPOLLIN`、`ev.data.fd = server_fd`
+- [x] `epoll_wait` 三态：`>0` 就绪个数 / `0` 超时 / `-1` 出错（`EINTR` → `continue` 重试）
+- [x] `if (events[i].data.fd == server_fd)` 区分"总机事件"
+- [x] `accept` **循环到 `EAGAIN/EWOULDBLOCK`**（一次事件可能对应队列里多个新连接）
+- [x] 踩过"少一个 `}` → 整段事件循环变成死代码"（已修，注释里留了警告）
+
+**还没做的**：client fd 还没纳入 epoll → CP6b。
 
 ---
 
@@ -319,6 +378,21 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - TIME_WAIT：主动关闭方等 2MSL（Linux 约 60 秒），期间占用本地端口
 - 阻塞式 `read` + 单线程 → **一个不发数据的客户端就能卡死整个服务器**
 
+**epoll / 事件驱动（CP6a）**
+
+- **思想转变**：从"我主动去读、没数据就等着" → "**先把连接登记给内核、内核告诉我谁就绪**"（Reactor）
+- `fcntl(fd, F_GETFL, 0)` 里那个 `0` 是**占位符**（`man 2const F_GETFL` 原文：*"arg is ignored"*）
+- **必须读-改-写三步**：`F_SETFL` 是**整体替换** status flags，直接写 `O_NONBLOCK` 会把别的标志抹掉
+- `O_NONBLOCK` 的效果：`read` 没数据时**立刻返回 -1 + `EAGAIN`**（而不是挂起线程）
+- **`EAGAIN` 不是错误**，是"这一轮读完了"；`EAGAIN == EWOULDBLOCK`（Linux 同值）
+- 非阻塞 `read` 的**四态**：`>0` 数据 / `0` EOF / `-1`+`EAGAIN` 读完了 / `-1`+其他 真错误
+- `epoll_event.data` 是**你写给内核的标记，事件回来时原样带回** → 用它分辨事件属于哪个 fd
+- `epoll_wait` 的 `timeout`：`-1` 永久等（0% CPU）/ `0` 立即返回 / `>0` 等多少毫秒
+- **LT vs ET**：LT（默认）只要没读完就**还会**通知你；ET（要加 `EPOLLET`）只在状态变化时通知一次，**必须循环读到 `EAGAIN`**
+- `sizeof(struct epoll_event) == 12`（因为 `__EPOLL_PACKED`；不加会因对齐补到 16）
+- **一次事件可能对应多个就绪 fd，也可能对应一个 fd 的多批数据** → `accept` 和 `read` 都要**循环到 `EAGAIN`**
+- `EPOLLRDHUP`：对端 half-close 的通知，判断断开比 `EPOLLIN` 更早更准
+
 ---
 
 ## 四、亲手撞过的坑 → 见 `pitfalls.md`
@@ -335,7 +409,7 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 
 `pitfalls.md` 里还有：**症状速查表**（看到报错直接查编号）、**常用命令小抄**、**SIGPIPE 专题**。
 
-**CP5 阶段新撞的、还没归档的坑**（下次更新 `pitfalls.md` 时补进去）：
+**CP5 / CP6 阶段新撞的、还没归档的坑**（下次更新 `pitfalls.md` 时补进去）：
 
 | # | 现象 | 根因 |
 | --- | --- | --- |
@@ -347,6 +421,11 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 | D11 | 两个请求一次发，只回了一个响应 | **粘包**：`\r\n\r\n` 只匹配到第一个请求，多余的被 `close` 丢弃 |
 | E4 | `else { perror("read"); }` 打印 `read: Success` | 隔了逻辑分支再 `perror` → 打印**过期的 errno** |
 | E5 | body 上限复用了 `MAX_HEADER_SIZE` | 头/体是两个约束，共用一个常量会误杀合法请求（8KB body 太小）|
+| E6 | 小写 `content-length` 不被识别 | `find("Content-Length: ")` **大小写敏感**；RFC 9110 §5.1 规定头字段名不敏感 |
+| E7 | `Content-Length:5`（冒号后无空格）不被识别 | 冒号后的 OWS 可为 0 个（RFC 9112 §5），写死一个空格就会漏 |
+| E8 | `Content-Length: 10abc` 被当成 10 接受 | `stoul` 遇非数字就停 → 要先用 `isAllDigits` 卡纯数字 |
+| B4 | `int fcntl(fd, F_SETFL, ...)` 编译报错 | 那是**声明变量**的语法，不是调用函数 |
+| B5 | 事件循环整段不执行（死代码）| `if (epoll_ctl(...) < 0) { ... }` **少一个 `}`**，把后面全关进了错误分支 |
 
 ---
 
@@ -354,12 +433,19 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 
 - [x] **CP5a**：半包（按连接读缓冲区）+ 请求头大小上限
 - [x] **CP5b**：按 `Content-Length` 收全 body + body 大小上限
-- [ ] **小修**：把 body 上限拆成独立的 `MAX_BODY_SIZE`（1MB，和 day2.cpp 一致）；`clang-format -i p2.cpp`
-- [ ] **可选**：`Content-Length` 大小写不敏感（RFC 9110 §5.1，现在小写识别不了）
-- [ ] **`day4.cpp`：非阻塞 IO + `epoll`** ← **下一步，解决"一个慢客户端卡死全服"**
+- [x] **小修**：body 上限拆成独立的 `MAX_BODY_SIZE`（1MB，与 nginx `client_max_body_size` 默认值一致）
+- [x] **修 3 个解析问题**：头字段名大小写（RFC 9110 §5.1）/ 冒号后 OWS（RFC 9112 §5）/ 非法值 `10abc`（回归用例 t11~t13）
+- [x] **CP6a**：`epoll` 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN`（`epoll.cpp`，提交 `e468ac9`）
+- [ ] **CP6b**：把 **client fd 纳入 epoll** ← **下一步**
+      · 做法：`conn_fd` 设非阻塞 → `EPOLL_CTL_ADD` → 事件循环里用 `events[i].data.fd` 区分总机/分机
+      · 验收：同时开 3 个 `nc` **都不关**，打印的 fd 应该是 **5、6、7**（而不是全是 5）
+- [ ] **CP6c**：引入 `ClientContext` + `map<fd, ClientContext>`，把 CP5 的状态机搬进事件驱动
+      · 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
+      · 验收：`tests/p2_test.py` 的 13 个用例**全部还要通过**（最好的回归测试）
+- [ ] **CP6d**：加固 —— 头/体上限、`EPOLL_CTL_DEL` + `clients.erase` 配对、`EPOLLRDHUP`、错误隔离
 - [ ] `day5.cpp`：`epoll` + 线程池（单 Reactor）；注意 fd 所有权交接的竞态
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
-- [ ] **粘包 / keep-alive**：等 epoll 上来之后再做（配套：`read_buffer.erase` 消费已处理字节、响应头按请求决定、idle 超时）
+- [ ] **粘包 / keep-alive**：等 CP6c 之后再做（配套：`read_buffer.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
 
 > 为什么 keep-alive 排在 epoll 后面：阻塞模型下一个 keep-alive 连接会**永久占住**唯一的服务线程，反而放大弱点。
 
@@ -406,3 +492,21 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 22. 半包和粘包是同一个问题的两面吗？它们各自需要什么手段？
 23. 你现在是用什么方式"规避"粘包的？代价是什么？
 24. 要真正支持 keep-alive，需要改哪三处？（提示：循环解析、消费缓冲区、按请求决定关闭）
+
+**解析的严谨性（CP5 的三个修复）**
+
+25. HTTP 头字段名区分大小写吗？你在哪份规范的哪一节看到的？
+26. `Content-Length:5`（冒号后没有空格）合法吗？为什么？语法是哪一节给的？
+27. `std::stoul("10abc")` 返回什么？为什么必须在它之前先做 `isAllDigits`？
+28. 为什么"解析失败的测试"**不能只看"最终有没有返回 200"**？正确的判据是什么？
+
+**CP6a（epoll 事件循环）**
+
+29. 为什么要把 `server_fd` 设成非阻塞？不设会怎样？
+30. `fcntl(fd, F_GETFL, 0)` 里那个 `0` 是什么？为什么不能省？
+31. 为什么 `F_SETFL` 必须"读-改-写"三步，不能直接 `fcntl(fd, F_SETFL, O_NONBLOCK)`？
+32. `epoll_event.data.fd` 是谁填的？事件回来时靠什么分辨"这个事件属于哪个 fd"？
+33. `epoll_wait` 的三个返回值分别是什么？遇到 `EINTR` 该怎么处理？
+34. 为什么 `accept` 要循环到 `EAGAIN`？一次事件不是只对应一个连接吗？
+35. LT 和 ET 有什么区别？现在用的是哪个？为什么先用它？
+36. 空闲时服务器在干什么？用哪条命令能看出"睡在 `ep_poll` 里、0% CPU"？

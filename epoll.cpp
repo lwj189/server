@@ -1,5 +1,9 @@
 #include <iostream>        // std::cout / std::endl
 #include <cstdint>         // uint16_t
+#include <cstddef>         // size_t
+#include <string>          // std::string（CP6c-2：inbuf / 请求文本）
+#include <cctype>          // std::tolower
+#include <exception>       // std::exception（stoull 溢出时抛的那个）
 #include <cerrno>          // errno / EAGAIN / EWOULDBLOCK / EINTR
 #include <csignal>         // signal / SIGPIPE / SIG_IGN
 #include <sys/socket.h>    // socket / bind / listen / setsockopt / accept / sockaddr
@@ -12,6 +16,13 @@
 #include <unordered_map>   // std::unordered_map（CP6c：fd → 连接状态）
 
 constexpr uint16_t PORT = 8888;   // 监听端口
+
+// ★【DoS 保护】请求头 / 请求体大小上限（和 p2.cpp 同一套值）
+//   没有上限的实现会被"一直发数据、永远不发 \r\n\r\n"的客户端吊死（内存涨爆）。
+//   MAX_HEADER_SIZE = 8 KB 与 nginx 的 large_client_header_buffers 同量级；
+//   MAX_BODY_SIZE = 1 MB 与 nginx 的 client_max_body_size 默认值一致。
+constexpr size_t MAX_HEADER_SIZE = 8 * 1024;
+constexpr size_t MAX_BODY_SIZE = 1024 * 1024;
 
 // ===========================================================================
 // CP6c：每条连接的状态
@@ -27,9 +38,155 @@ constexpr uint16_t PORT = 8888;   // 监听端口
 // ===========================================================================
 struct ClientContext {
     int fd = -1;
-    // CP6c-2 会加在这里，例如：
-    //     std::string inbuf;   // 这条连接攒到的字节
+
+    // ---- CP6c-2 新增：这条连接自己的读缓冲区 ----
+    // 为什么必须是"每条连接一个"：TCP 是字节流，一次 read 拿到的可能只是半个请求。
+    // 半个请求得先存着，等剩下的到了再拼起来 —— 而"等"意味着函数要返回，
+    // 栈上的局部变量活不到下一次事件，所以只能存在这里。
+    // （p2.cpp 里它是 main 循环里的一个局部 std::string，一次只服务一条连接，
+    //   所以放栈上够用；epoll 版同时持有很多条，就必须一人一个。）
+    std::string inbuf;
 };
+
+// ===========================================================================
+// CP6c-2：下面三个纯函数是从 p2.cpp 原样搬过来的（CP5 的成果，不用重写）
+//
+// 它们不依赖 socket、不依赖 epoll —— 输入一段字符串，输出解析结果。
+// 正因为是纯函数，"搬家"才这么省事：换个文件照样能用。
+// ===========================================================================
+
+// 只转 ASCII 小写。为什么不用真 Unicode 小写：HTTP 头字段名限定为 ASCII token，
+// 而且 std::tolower 的参数必须是 unsigned char 的值（负数进去是未定义行为）。
+static std::string toLowerAscii(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+// 在"头部区域"[0, header_end) 内查找字段 name，找到就返回值（已去掉两端空白）。
+// 三个协议细节：① 字段名大小写不敏感（RFC 9110 §5.1）
+//              ② 冒号后的 OWS 可为 0 个（RFC 9112 §5）
+//              ③ 只在头部区域内找 —— 否则 body 里的同名文本会把解析器骗到
+static bool findHeader(const std::string& buf, size_t header_end,
+                       const std::string& name, std::string& value) {
+    const std::string want = toLowerAscii(name);
+    size_t pos = 0;
+
+    while (pos < header_end) {
+        size_t line_end = buf.find("\r\n", pos);
+        if (line_end == std::string::npos || line_end > header_end) {
+            line_end = header_end;   // 防御：绝不读越过头部区域
+        }
+
+        const std::string line = buf.substr(pos, line_end - pos);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos && toLowerAscii(line.substr(0, colon)) == want) {
+            size_t v = colon + 1;
+            while (v < line.size() && (line[v] == ' ' || line[v] == '\t')) ++v;   // 跳过 OWS
+            value = line.substr(v);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+                value.pop_back();
+            }
+            return true;
+        }
+
+        if (line_end >= header_end) break;
+        pos = line_end + 2;   // +2 跳过 CRLF
+    }
+    return false;
+}
+
+// 整个字符串都是十进制数字？（空串不算）
+// 为什么要它：std::stoull 是"解析到非数字就停"，stoull("10abc") 会返回 10 ——
+// 非法值被当成合法值接受了（RFC 9112 §6.3 要求这种情况以 400 拒绝）。
+static bool isAllDigits(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+// ===========================================================================
+// CP6c-2 的心脏：从 ctx.inbuf 里取出【一个完整请求】并响应
+//
+// 对比 p2.cpp 的同款逻辑 —— 这是"状态机切片"最直观的一处：
+//   p2.cpp：一个 while 循环堵在那里读到收全为止（连续执行，栈上有 read_buffer）
+//   这里  ：每次事件调用一次，不够就【原地返回】，进度留在 ctx.inbuf 里
+//
+// 返回值：true  = 已经有结果了（响应发了 / 或这条连接该被丢弃）→ 调用方收连接
+//         false = 还不够一个完整请求 → 等下次 EPOLLIN 再进来接着算
+// ===========================================================================
+static bool tryHandleRequest(ClientContext& ctx) {
+    // ---- ① 头部定界：找 \r\n\r\n（RFC 9112 §2.1）----
+    const size_t header_end = ctx.inbuf.find("\r\n\r\n");   // ← 空 1：定界符是什么？
+    if (header_end == std::string::npos) {                  // ← 空 2：没找到时 find 返回什么？
+        // 头部还没收全。但别无限等 —— 对方可能永远不发定界符（DoS）。
+        // ⚠ 判断顺序和 p2.cpp 一致：先看"收全没有"，再看"超限"。
+        //   反过来会把"头很小但 body 很大"的合法请求误杀。
+        if (ctx.inbuf.size() > MAX_HEADER_SIZE) {
+            std::cout << "请求头过大 —— 丢弃 fd=" << ctx.fd << std::endl;
+            // 想想：true 表示"这条连接有结果了，调用方可以收掉它"
+            return true;   // ← 空 3
+        }
+        return false;   // 还不够，等下次事件
+    }
+
+    // ---- ② 解析 Content-Length（CP5 的三个坑由上面两个纯函数解决）----
+    size_t content_len = 0;   // 没有这个头字段就按 0 处理（普通 GET 就是这种）
+    std::string cl_value;
+    if (findHeader(ctx.inbuf, header_end, "Content-Length", cl_value)) {
+        if (!isAllDigits(cl_value)) {
+            std::cout << "Content-Length 非法（不是纯数字）—— 丢弃 fd=" << ctx.fd << std::endl;
+            return true;
+        }
+        try {
+            const unsigned long long v = std::stoull(cl_value);
+            if (v > MAX_BODY_SIZE) {
+                std::cout << "body 过大（Content-Length=" << v << "）—— 丢弃 fd=" << ctx.fd
+                          << std::endl;
+                return true;
+            }
+            content_len = static_cast<size_t>(v);
+        } catch (const std::exception&) {
+            std::cout << "Content-Length 溢出 —— 丢弃 fd=" << ctx.fd << std::endl;
+            return true;
+        }
+    }
+
+    // ---- ③ 一个完整请求 = 头部 + 结尾空行 + body，一共多少字节？----
+    //     header_end 指向 "\r\n\r\n" 的【第一个 \r】，头部内容本身不含这 4 个字节。
+    const size_t total = header_end + 4 + content_len;   // ← 空 4
+
+    // ---- ④ 收齐了没有？----
+    // 没齐就原地返回 —— 这一行就是"切片"：
+    // 函数退出，进度留在 ctx.inbuf 里，等下一个 EPOLLIN 再进来重新算一遍。
+    if (ctx.inbuf.size() < total) {
+        return false;   // 还不够，等下次事件
+    }
+
+    // ---- ⑤ 收齐了：处理 + 响应（这段从 p2.cpp 原样搬过来）----
+    const std::string request = ctx.inbuf.substr(0, total);
+    std::cout << "收到完整请求:\n"
+              << request << std::endl;
+
+    const std::string body = "<h1>Hello from my own server!</h1>";
+    const std::string response = "HTTP/1.1 200 OK\r\n"
+                                 "Content-Type: text/html\r\n"
+                                 "Content-Length: " +
+                                 std::to_string(body.size()) +
+                                 "\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n" +
+                                 body;
+
+    if (send(ctx.fd, response.c_str(), response.size(), 0) < 0) {
+        perror("send");
+    }
+    return true;   // 响应已发（Connection: close 语义）→ 调用方收掉这条连接
+}
 
 int main() {
     // 忽略 SIGPIPE：客户端提前断开时 send 不会杀掉整个进程，而是返回 -1 (EPIPE)
@@ -210,6 +367,10 @@ int main() {
                     continue;                 // 账本里没这条 —— 不该发生，跳过别硬来
                 }
 
+                // ⚠ 用【引用】而不是拷贝：拷贝一份改的是副本，inbuf 攒的东西全丢了。
+                //   （副本会静默地什么都不做 —— 和 for (char c : out) 少个 & 是同一类 bug）
+                ClientContext& ctx = it->second;
+
                 char buf[1024];
                 // 为什么要循环：一次事件只保证"现在有数据可读"，
                 // 不保证"读一次就读完了"。和 CP6a 里 accept 循环到 EAGAIN 是同一个形状 ——
@@ -218,7 +379,23 @@ int main() {
                     ssize_t n = read(fd, buf, sizeof(buf));
 
                     if (n > 0) {
-                        send(fd, buf, n, 0);   // 回显：CP4 的 send 在这里第一次被复用
+                        // ---- CP6c-2：攒进这条连接【自己】的缓冲区（不再回显）----
+                        // 是 append 不是 = ：一段一段往上接，这就是半包/粘包的落脚点。
+                        ctx.inbuf.append(buf, static_cast<size_t>(n));
+
+                        // 每读完一段都问一句："现在够一个完整请求了吗？"
+                        if (tryHandleRequest(ctx)) {
+                            // 有结果了（响应已发，或这条连接被判为非法）→ 收掉它。
+                            // 两本账一起销：fd 靠 close，账本条目靠 erase。
+                            close(fd);
+                            if (clients.erase(fd) == 0) {
+                                std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账"
+                                          << std::endl;
+                            }
+                            break;
+                        }
+                        // 不够一个完整请求：什么都不做，回到 while 顶部继续 read 到 EAGAIN。
+                        // 攒下的字节留在 ctx.inbuf 里，等下一个 EPOLLIN 事件再接着算。
                     } else if (n == 0) {
                         // read 返回 0 = 对端【正常】关闭（有序关闭，不是 RST）。
                         // 只 close 就够了，不必显式 EPOLL_CTL_DEL：

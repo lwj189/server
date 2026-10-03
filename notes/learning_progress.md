@@ -237,8 +237,8 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
 ```
 ① 编译：-Wall -Wextra -Wformat=2 -Wconversion → 退出码 0，零警告
 
-② tests/cp6b_test.py → 4/4 全绿
-   [1] echo   [2] 分多次到达   [3] 并发不串台   [4] fd 配平
+② tests/cp6b_test.py → 4/4 全绿        ← 该文件现已改名 tests/balance_test.py
+   [1] echo   [2] 分多次到达   [3] 并发不串台   [4] fd 配平   （[1][2][3] 已随 CP6c-2 退役）
 
 ③ 连跑 3 次（服务器不重启），基线【始终是 5】
    累计 78 条连接进出，fd 数从头到尾没动过
@@ -352,6 +352,26 @@ man 2 epoll_ctl | col -b | grep -n -A3 EPOLLIN
 报 `'response' was not declared` → 检查**作用域**。
 报 `expected '}' at end of input` → 括号层级错乱（改代码时最常见）。
 
+**★ 查 C++ 标准库方法的签名（`man` 查不到，这条是最快的路）：故意【少传参数】。**
+编译器会把**所有重载连同参数个数**一起列出来 —— 等于免费给你一张签名表：
+
+```bash
+cat > /tmp/idx.cpp <<'EOF'
+#include <string>
+int main() { std::string s; s.find(); }
+EOF
+g++ -std=c++17 -c /tmp/idx.cpp -o /dev/null 2>&1 | grep candidate
+```
+
+```
+note: there are 5 candidates
+  candidate 3: find(const basic_string&, size_type)   ←  expects 2 arguments
+  candidate 4: find(const _CharT*, size_type)         ←  字符串字面量走这个
+  candidate 5: find(_CharT, size_type)                ←  找单个字符
+```
+
+配 #11：**先翻英文猜方法名 → 少传参数逼编译器列签名 → 数参数个数 → 编译验证。**
+
 ### 7. 改源码 → 保存 → 重新编译
 
 ```bash
@@ -401,6 +421,30 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 **括号里的 `(2)` / `(3type)` / `(7)` / `(2const)` 是手册分节，不是版本号。**
 
 配合 #4 三档过滤法一起用：某句看不懂时先问一句 —— **"它会改变我这一行代码吗？"** 不会就跳过。
+
+### 11. STL 方法名不是密码，就是英文单词
+
+卡在"这功能该调哪个方法"时，先**把中文意图翻成英文**，再去头文件里列方法名：
+
+| 中文 | 英文 |
+| --- | --- |
+| 找 | `find` |
+| 删 | `erase` / `clear` |
+| 加 | `insert` / `emplace` |
+| 末尾 | `end` |
+| 几个 | `size` / `count` |
+| 空吗 | `empty` |
+
+```bash
+# 一条命令列出 unordered_map 的所有方法名（全是英文单词）
+H=/usr/include/c++/15/bits/unordered_map.h
+grep -oP "^      \K[a-z_]+(?=\()" "$H" | sort -u
+```
+
+流程：**列方法名 → 翻英文 → 数参数个数 → 编译验证**。
+
+⚠ 配套的坑：`end()` 和 `end(fd)` 是两个完全不同的东西（后者是"第 fd 号**桶**的末尾"），
+只差两个字母，而且**编译不报错** —— 报错了就往回数：**参数个数对不上**。
 
 ---
 
@@ -580,15 +624,23 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - [x] **CP6c-1**：引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**）
       · 额外踩到：多了**第二本账**（账本条目）。漏 `erase` 时编译零警告、测试全绿
         → 加了**哨兵**，而且必须在 `emplace` 那边（放 `erase` 那边永远喊不出来）
-- [ ] **CP6c-2**：把 CP5 的**状态机搬进来**（`inbuf` + 解析），回真正的 HTTP 响应 ← **下一步**
+- [x] **CP6c-2**：把 CP5 的**状态机搬进来**（`inbuf` + 解析），回真正的 HTTP 响应
       · 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
-      · 验收：`tests/p2_test.py` 的 **23 项检查（t1~t13）**对着 `./epoll` 全部通过（最好的回归测试）
-- [ ] **CP6d**：加固
+      · 做法：`ClientContext` 加 `std::string inbuf`；三段纯函数（`toLowerAscii`/`findHeader`/
+        `isAllDigits`）从 `p2.cpp` **原样搬**（纯函数搬家不要钱，代码逐字节相同）；
+        新增 `tryHandleRequest(ctx)` —— p2 那边是 `while` 堵着读到收全，这边是**不够就 return，等下次**
+      · 5 个空：`"\r\n\r\n"` / `std::string::npos` / `true`（头超限判死刑）/ `header_end + 4 + content_len` / `false`
+      · 验收：`tests/p2_test.py` 的 **23 项**对着 `./epoll` **全部通过**（搬迁前实测 **0/23**）
+      · ⚠ 踩到的：`total` 只写 `header_end + 4`（漏了 `+ content_len`）→ 编译器警告
+        `content_len set but not used`，测试 **17/23**、6 个失败全是"**提前响应**"
+      · 副产物：`tests/balance_test.py`（原 `cp6b_test.py`）—— 见下面「两个轴」一节
+- [ ] **CP6d**：加固 ← **下一步**
       · `EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下会空转烧 CPU
       · 部分写 —— `send` 返回 < n 时要有输出缓冲 + `EPOLLOUT`
+      · 粘包 / keep-alive（配套：循环解析、`inbuf.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
 - [ ] `day5.cpp`：`epoll` + 线程池（用 **C++11 并发库**：`std::thread`/`mutex`/`condition_variable`）；注意 fd 所有权交接的竞态
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
-- [ ] **粘包 / keep-alive**：等 CP6c 之后再做（配套：`read_buffer.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
+- [ ] **粘包 / keep-alive**：等 CP6d 一起做（配套：`inbuf.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
 
 > 为什么 keep-alive 排在 epoll 后面：阻塞模型下一个 keep-alive 连接会**永久占住**唯一的服务线程，反而放大弱点。
 
@@ -670,6 +722,42 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 45. `read_buffer` 为什么**不能**声明在事件处理的那段代码里？
 46. `ClientContext` 为什么用 **fd 当 key**？事件回来时你知道什么、不知道什么？
 47. 现在有哪**两本账**？各自的销账手段是什么？
-48. 漏了 `erase` 会怎样？为什么 `cp6b_test.py` **抓不到**它？
+48. 漏了 `erase` 会怎样？为什么 **HTTP 测试（`p2_test.py`）抓不到**它？
 49. 哨兵为什么要放在 `emplace` 那边，**不能只放在 `erase` 那边**？
 50. `emplace` 在 key 已存在时会怎样？`operator[]` 呢？这个差别为什么重要？
+
+**CP6c-2（把状态机搬进来，回真正的 HTTP）**
+
+51. `tryHandleRequest` 的返回值**不是**"成功/失败"，那 `true` / `false` 各代表什么？
+52. `total = header_end + 4 + content_len` 里那个 `+4` 是什么？**漏掉 `content_len`** 会出什么事？
+53. `find` 找不到时返回什么？为什么**不能拿它跟 `-1` 比**？
+54. "一个完整请求"的定义是哪份规范的哪一节给的？`\r\n\r\n` 为什么是它、而不是 `\n\n`？
+55. 头部超限时为什么返回 `true` 而不是 `false`？返回 `false` 会发生什么？
+56. "不够一个完整请求就 `return false`"这一行，**为什么它就是"状态机切片"**？
+57. 三段纯函数从 `p2.cpp` 搬到 `epoll.cpp` 为什么**一行都不用改**？"纯"在这里指什么？
+58. `ClientContext& ctx = it->second;` 里那个 `&` **去掉**会怎样？为什么这类 bug 特别难查？
+59. 为什么 `cp6b_test.py` 的 [1][2][3] 在 CP6c-2 后**自动失效**了，而 [fd 配平] 没有？
+
+### 两个轴：协议正确性 vs 资源配平
+
+| | 测什么 | 脚本 |
+| --- | --- | --- |
+| **协议正确性** | 回答**对不对** | `tests/p2_test.py`（23 项） |
+| **资源配平** | 东西有没有**还回去**（fd + 账本） | `tests/balance_test.py`（4 项） |
+
+**两者正交 —— 一个全绿不代表另一个绿**（实测，造坏版本验的）：
+
+- 摘掉 EOF 路径的 `close` → **23/23 HTTP 测试全过**，但 fd 一路泄漏
+- 摘掉所有 `erase` → **23/23 全过、fd 还是平的**，只有**哨兵**会喊（232 次）
+
+> 所以"测试全绿"这句话必须带上"**哪套测试**"。这也是为什么 CI 里 epoll 要跑两个脚本。
+
+### 判据本身也会骗人：假绿 与 假红
+
+| | 现象 | 例子 |
+| --- | --- | --- |
+| **假绿** | 判据对"要测的那件事"不敏感，坏实现照样过 | "3 个 nc 看到 fd 5/6/7" —— 泄漏版同样打印 5、6、7 |
+| **假绿 · 进阶** | **判据量错了对象** | `balance_test` 对着残留的旧服务器跑，`--pid` 指向新进程却全绿 → 已加"pid 必须是端口监听者"校验 |
+| **假红** | 判据读了一个**会变的量** | fd 基线在服务器还没回收完连接时拍了快照 → 报出"多了 -2 个"这种负数 → 改成"等稳定后再读" |
+
+**结论：判据也要被验证 —— 要问"反例能不能通过"（抓假绿）、"好实现会不会被误杀"（抓假红）。**

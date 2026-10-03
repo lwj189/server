@@ -239,11 +239,15 @@ while (true) {
 | **CP6a** | 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN` | ✅ 完成（`e468ac9`） |
 | **CP6b** | 把 **client fd 纳入 epoll**（设非阻塞 + `EPOLL_CTL_ADD`），事件循环里区分 `server_fd` / client fd | ✅ 完成（`a9e7494`） |
 | **CP6c-1** | 引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**） | ✅ 完成（`5392991`） |
-| **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应 | ▶ 下一步（验收：`p2_test.py` 23/23） |
-| **CP6d** | 加固：`EMFILE` 忙等、部分写 | ⬜ |
+| **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应（`inbuf` + `tryHandleRequest`） | ✅ 完成（验收：`p2_test.py` 23/23 对着 `./epoll`） |
+| **CP6d** | 加固：`EMFILE` 忙等、部分写、粘包 / keep-alive | ▶ 下一步 |
 
-**CP6b 的验收**：`python3 tests/cp6b_test.py` → **4/4 全绿**
+**CP6b 的验收**：当时的 `cp6b_test.py` → **4/4 全绿**
 （[1] echo / [2] 分多次到达 / [3] 并发不串台 / [4] **fd 配平**）
+
+> 📌 这个文件后来改名 `tests/balance_test.py`：CP6c-2 把 echo 契约换成了真正的 HTTP，
+> [1][2][3] 随之退役 —— 但 **[4] fd 配平与协议无关**，跨了两次重构依然成立，所以留下并扩成了
+> "fd + 账本"两本账的配平测试（新增 [4] 哨兵没响）。详见 `learning_progress.md` 的「两个轴」。
 
 > ⚠ **这条判据是从一个"假绿"改过来的，别改回去。**
 >
@@ -258,15 +262,25 @@ while (true) {
 > **教训：验收标准本身也要被验证 —— 要问"反例能不能通过"。**
 
 **CP6c 的核心问题**：`read_buffer` 现在该放哪？
-答案是 `struct ClientContext { std::string read_buffer; bool header_done; ... };`
+答案是 `struct ClientContext { int fd; std::string inbuf; };`
 放在 `unordered_map<int, ClientContext>` 里 —— 因为"下一次事件"是**另一次函数调用**，
-局部变量活不到那时。**CP6c-1 已经把"账本 + 空壳对象"这套机制验证过了。**
+局部变量活不到那时。**CP6c-1 已经把"账本 + 空壳对象"这套机制验证过了，
+CP6c-2 把 `inbuf` 真正用起来了。**
 **这就是"状态机切片"**：把一个连续执行的函数，改造成"每次事件恢复一点进度"。
 
+**CP6c-2 的切片点**（和 `p2.cpp` 对照着看最清楚）：
+
+| | `p2.cpp`（阻塞版） | `epoll.cpp`（事件驱动） |
+| --- | --- | --- |
+| 收到一部分 | `while (!header_done) { read... }` **堵着等** | `ctx.inbuf.append(...)` 攒起来 |
+| 还不够一个请求 | 循环继续 | **`return false`**，函数退出，进度留在 `inbuf` |
+| 下次怎么接着算 | 不用管（没退出过） | 下一个 `EPOLLIN` 事件**重新进函数**，重头算一遍 `total` |
+| 收齐了 | 就地处理 + 响应 | 就地处理 + 响应 + `return true`（调用方收连接） |
+
 **CP6c-1 额外踩到的**：从这里开始有**两本账**（fd 号 + 账本条目）。
-漏 `erase` 时编译零警告、`cp6b_test.py` 照样 4/4 全绿 ——
+漏 `erase` 时编译零警告、**`p2_test.py` 23 项照样全绿、fd 也是平的** ——
 所以加了个哨兵，而且**哨兵必须放在 `emplace` 那边**（放 `erase` 那边永远喊不出来）。
-详见 `HANDOFF.md` §7 和 `BRANCH_HANDOFF.md`。
+详见 `notes/learning_progress.md` 的「两个轴」与自检问题 49/50、以及本文件 §11.3。
 
 ---
 
@@ -326,7 +340,7 @@ while (true) {
 | 阶段 | 手段 | 状态 |
 | --- | --- | --- |
 | ① **手工配平** | 保证每条路径都 `close`（例如"先 `close` 再 `continue`"） | ✅ CP6b 完成 |
-| ② **`close` / `erase` 配对** | `close(fd)` 和 `clients.erase(fd)` 永远一起出现 | ✅ CP6c-1 完成 |
+| ② **`close` / `erase` 配对** | `close(fd)` 和 `clients.erase(fd)` 永远一起出现 | ✅ CP6c-1 完成<br>✅ CP6c-2 补齐（`tryHandleRequest` 成功路径也要配对） |
 | ③ **RAII** | 把 fd 包进一个类，析构函数自动 `close` | ⬜ 以后（C++ 进阶） |
 
 **检测手段也在升级：**
@@ -334,8 +348,8 @@ while (true) {
 | 阶段 | 怎么发现泄漏 |
 | --- | --- |
 | 最早 | 手工 `ls /proc/<pid>/fd \| wc -l`，反复请求 1000 次看它涨不涨 |
-| CP6b 起 | **`tests/cp6b_test.py` 的 `[4]`** —— 自动比对基线，泄漏的实现过不了 |
-| CP6c 起 | ⚠ 多了**第二本账**（账本条目），而 fd 测试**看不见**它 → 靠**哨兵** |
+| CP6b 起 | **`tests/balance_test.py` 的 `[1][2][3]`** —— 自动比对 fd 基线，泄漏的实现过不了 |
+| CP6c 起 | ⚠ 多了**第二本账**（账本条目），而 fd 测试**看不见**它 → 靠**哨兵**<br>（`balance_test.py` 的 `[4]` 把"哨兵有没有响"也变成了自动判据） |
 
 **CP6c 的哨兵（第二本账唯一的报警器）：**
 
@@ -349,5 +363,5 @@ if (!clients.emplace(conn_fd, ctx).second) {
 **为什么必须在 `emplace`**：漏了 `erase` 之后，旧条目还躺在账本里；
 下一个连接复用同一个 fd 时，`erase` 照样能删掉它（返回 1）—— 所以 **`erase` 那边永远喊不出来**。
 
-**实测**：故意删掉一条 `erase` → `cp6b_test.py` **照样 4/4 全绿**（编译也零警告），
-但哨兵报了 **23 次**。**测试看不见的 bug，只有哨兵能抓。**
+**实测**：故意删掉所有 `erase` → `p2_test.py` **23 项照样全绿、fd 也是平的**（编译也零警告），
+但哨兵报了 **232 次**。**测试看不见的 bug，只有哨兵能抓。**

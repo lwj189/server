@@ -573,14 +573,20 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 - [x] **小修**：body 上限拆成独立的 `MAX_BODY_SIZE`（1MB，与 nginx `client_max_body_size` 默认值一致）
 - [x] **修 3 个解析问题**：头字段名大小写（RFC 9110 §5.1）/ 冒号后 OWS（RFC 9112 §5）/ 非法值 `10abc`（回归用例 t11~t13）
 - [x] **CP6a**：`epoll` 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN`（`epoll.cpp`，提交 `e468ac9`）
-- [ ] **CP6b**：把 **client fd 纳入 epoll** ← **下一步**
-      · 做法：`conn_fd` 设非阻塞 → `EPOLL_CTL_ADD` → 事件循环里用 `events[i].data.fd` 区分总机/分机
-      · 验收：同时开 3 个 `nc` **都不关**，打印的 fd 应该是 **5、6、7**（而不是全是 5）
-- [ ] **CP6c**：引入 `ClientContext` + `map<fd, ClientContext>`，把 CP5 的状态机搬进事件驱动
+- [x] **CP6b**：把 **client fd 纳入 epoll**
+      · 做法：`conn_fd` 设非阻塞 → `EPOLL_CTL_ADD` → 用 `events[i].data.fd` 区分总机/分机
+      · 验收：`tests/cp6b_test.py` **4/4 全绿**（echo / 分多次到达 / 并发不串台 / **fd 配平**）
+      · ⚠ 旧的"同时开 3 个 `nc` 不关、该打印 fd 5/6/7"判据是**假绿**，已废 —— 泄漏版照样通过
+- [x] **CP6c-1**：引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**）
+      · 额外踩到：多了**第二本账**（账本条目）。漏 `erase` 时编译零警告、测试全绿
+        → 加了**哨兵**，而且必须在 `emplace` 那边（放 `erase` 那边永远喊不出来）
+- [ ] **CP6c-2**：把 CP5 的**状态机搬进来**（`inbuf` + 解析），回真正的 HTTP 响应 ← **下一步**
       · 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
-      · 验收：`tests/p2_test.py` 的 13 个用例**全部还要通过**（最好的回归测试）
-- [ ] **CP6d**：加固 —— 头/体上限、`EPOLL_CTL_DEL` + `clients.erase` 配对、`EPOLLRDHUP`、错误隔离
-- [ ] `day5.cpp`：`epoll` + 线程池（单 Reactor）；注意 fd 所有权交接的竞态
+      · 验收：`tests/p2_test.py` 的 **23 项检查（t1~t13）**对着 `./epoll` 全部通过（最好的回归测试）
+- [ ] **CP6d**：加固
+      · `EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下会空转烧 CPU
+      · 部分写 —— `send` 返回 < n 时要有输出缓冲 + `EPOLLOUT`
+- [ ] `day5.cpp`：`epoll` + 线程池（用 **C++11 并发库**：`std::thread`/`mutex`/`condition_variable`）；注意 fd 所有权交接的竞态
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
 - [ ] **粘包 / keep-alive**：等 CP6c 之后再做（配套：`read_buffer.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
 
@@ -647,3 +653,23 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
 34. 为什么 `accept` 要循环到 `EAGAIN`？一次事件不是只对应一个连接吗？
 35. LT 和 ET 有什么区别？现在用的是哪个？为什么先用它？
 36. 空闲时服务器在干什么？用哪条命令能看出"睡在 `ep_poll` 里、0% CPU"？
+
+**CP6b（把分机纳入 epoll）**
+
+37. `accept` 出来的 socket 会**继承** `server_fd` 的 `O_NONBLOCK` 吗？依据在哪一页？
+38. 同一个 `EPOLLIN`，在**监听 socket** 上和**连接 socket** 上含义有什么不同？
+39. 新连接 / 有数据 / 对端发 FIN —— 这三种情况 `epoll_wait` 报的位掩码分别是什么？
+40. `read()` 返回 0 是什么意思？为什么说"**EOF 是以可读的形式通知你的**"？
+41. `read()==0` 时只 `close` 就够、不用 `EPOLL_CTL_DEL` —— 依据在哪？显式 DEL 有什么风险？
+42. 对端 RST 强断时位掩码是什么？`EPOLLERR`/`EPOLLHUP` 明明没订阅，为什么也会报？
+43. 服务器撞到 fd 上限后，如果代码只是 `break`，会发生什么？为什么？
+44. "3 个 nc 看到 fd 5、6、7" 和 "78 条连接后 fd 还是 5" —— 这两个现象分别说明什么？
+
+**CP6c（ClientContext + 连接账本）**
+
+45. `read_buffer` 为什么**不能**声明在事件处理的那段代码里？
+46. `ClientContext` 为什么用 **fd 当 key**？事件回来时你知道什么、不知道什么？
+47. 现在有哪**两本账**？各自的销账手段是什么？
+48. 漏了 `erase` 会怎样？为什么 `cp6b_test.py` **抓不到**它？
+49. 哨兵为什么要放在 `emplace` 那边，**不能只放在 `erase` 那边**？
+50. `emplace` 在 key 已存在时会怎样？`operator[]` 呢？这个差别为什么重要？

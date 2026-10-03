@@ -68,10 +68,12 @@ kill %1
 ├── .clang-format       ← 代码风格（4 空格缩进 / Attach 括号 / 指针贴左 / 不折行）
 ├── .github/workflows/ci.yml ← CI：严格编译 p2+epoll，再【串行】跑两套测试（23 项 + 4 项）
 ├── notes/
-│   ├── HANDOFF.md          ← 本文件
-│   ├── learning_progress.md ← 学习进度、概念清单、坑表格、命令小抄
-│   ├── epoll_notes.md      ← epoll 查阅笔记（API + 概念 + 坑）
-│   └── pitfalls.md         ← 更细的踩坑记录
+│   ├── HANDOFF.md          ← 本文件（给新对话的第一份）
+│   ├── learning_progress.md ← 主线进度：各 CP 小节 + 方法论 + 概念清单
+│   ├── epoll_notes.md      ← epoll 专题：API + 概念 + 坑 + 速查表
+│   ├── pitfalls.md         ← 更细的踩坑记录（CP1~CP4）
+│   ├── BRANCH_HANDOFF.md   ← 某个【分支对话】的交接（CP6b/CP6c-1 那一段）
+│   └── date.txt            ← 老存档：CP1 伪代码 + JMeter 压测原始数据
 └── tests/
     ├── p2_test.py       ← 【正确性】p2 的集成测试 t1~t13（半包/并发/RST/超长头/body 分片…）
     ├── cp6b_test.py     ← 【正确性】epoll 的 CP6b 验收（echo/分批/并发不串台/fd 配平）

@@ -1,4 +1,4 @@
-# epoll 学习笔记（CP6a 起）
+# epoll 学习笔记（CP6a ~ CP6c）
 
 > 来源：合并自两个分支会话的问答 —— epoll1（钻 API 细节）+ epoll2（问概念工程）。
 > 这是一份 **查阅型笔记**：以后遇到同样的问题直接翻这里，不用再问一遍。
@@ -236,17 +236,37 @@ while (true) {
 
 | 步骤 | 内容 | 状态 |
 | --- | --- | --- |
-| **CP6a** | 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN` | ✅ 完成（提交 `e468ac9`） |
-| **CP6b** | 把 **client fd 纳入 epoll**（设非阻塞 + `EPOLL_CTL_ADD`），事件循环里区分 `server_fd` / client fd | ▶ 下一步 |
-| **CP6c** | 引入 `ClientContext` + `map<fd, ClientContext>`，把 CP5 的**状态机搬进来** | ⬜ 难点 |
-| **CP6d** | 加固：头/体上限、`EPOLL_CTL_DEL` + `erase` 配对、`EPOLLRDHUP`、错误隔离 | ⬜ |
+| **CP6a** | 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN` | ✅ 完成（`e468ac9`） |
+| **CP6b** | 把 **client fd 纳入 epoll**（设非阻塞 + `EPOLL_CTL_ADD`），事件循环里区分 `server_fd` / client fd | ✅ 完成（`a9e7494`） |
+| **CP6c-1** | 引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**） | ✅ 完成（`5392991`） |
+| **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应 | ▶ 下一步（验收：`p2_test.py` 23/23） |
+| **CP6d** | 加固：`EMFILE` 忙等、部分写 | ⬜ |
 
-**CP6b 的验收**：同时开 3 个 `nc` 都不关，服务器打印的 fd 应该是 **5、6、7**（而不是全是 5）。
+**CP6b 的验收**：`python3 tests/cp6b_test.py` → **4/4 全绿**
+（[1] echo / [2] 分多次到达 / [3] 并发不串台 / [4] **fd 配平**）
+
+> ⚠ **这条判据是从一个"假绿"改过来的，别改回去。**
+>
+> 原来的写法是"同时开 3 个 `nc` 都不关，服务器打印的 fd 应该是 5、6、7"。
+> 实测发现：`close(conn_fd)` 被注释掉、fd 全泄漏时，**照样打印 5、6、7**。
+>
+> | | 泄漏版 | 配平版 |
+> | --- | --- | --- |
+> | 3 个 nc 同时开 | 打印 5、6、7 ✅ | 打印 5、6、7 ✅ |
+> | 跑 20 条连接后 | fd 11 → 31 | fd 5 → 5 |
+>
+> **教训：验收标准本身也要被验证 —— 要问"反例能不能通过"。**
 
 **CP6c 的核心问题**：`read_buffer` 现在该放哪？
 答案是 `struct ClientContext { std::string read_buffer; bool header_done; ... };`
-放在 `map<int, ClientContext>` 里 —— 因为"下一次事件"是**另一次函数调用**，局部变量活不到那时。
+放在 `unordered_map<int, ClientContext>` 里 —— 因为"下一次事件"是**另一次函数调用**，
+局部变量活不到那时。**CP6c-1 已经把"账本 + 空壳对象"这套机制验证过了。**
 **这就是"状态机切片"**：把一个连续执行的函数，改造成"每次事件恢复一点进度"。
+
+**CP6c-1 额外踩到的**：从这里开始有**两本账**（fd 号 + 账本条目）。
+漏 `erase` 时编译零警告、`cp6b_test.py` 照样 4/4 全绿 ——
+所以加了个哨兵，而且**哨兵必须放在 `emplace` 那边**（放 `erase` 那边永远喊不出来）。
+详见 `HANDOFF.md` §7 和 `BRANCH_HANDOFF.md`。
 
 ---
 
@@ -262,7 +282,7 @@ while (true) {
 | 等事件 | `man 2 epoll_wait` |
 | **LT vs ET、和 select/poll 的对比** | **`man 7 epoll`** |
 | EAGAIN / EINTR 从哪来 | 各调用的 **ERRORS** 一节（如 `man 2 read`） |
-| epoll_event 结构体 | `/usr/include/x86_64-linux-gnu/sys/epoll.h`（grep 最快） |
+| epoll_event 结构体 | **`man 3type epoll_event`**（含 `epoll_data_t` union 的完整定义）<br>或头文件 `/usr/include/x86_64-linux-gnu/sys/epoll.h`（grep 最快） |
 | socklen_t 是什么 | **`man 3type sockaddr`**（和 sockaddr 共用一页） |
 
 ---
@@ -301,15 +321,33 @@ while (true) {
 - 对应到 epoll：两个 fd **都要登记**（总机关心"新连接"，分机关心"可读"）
 - 对应到 CP6c：`conn_fd` 还要作为 `clients` 这个 map 的 **key**
 
-### 11.3 `conn_fd` 泄漏是**开放线索**，不是"学一个知识点就解决"
+### 11.3 `conn_fd` 泄漏是**分阶段收敛**的，不是"学一个知识点就解决"
 
-分阶段收敛，不是一步到位：
+| 阶段 | 手段 | 状态 |
+| --- | --- | --- |
+| ① **手工配平** | 保证每条路径都 `close`（例如"先 `close` 再 `continue`"） | ✅ CP6b 完成 |
+| ② **`close` / `erase` 配对** | `close(fd)` 和 `clients.erase(fd)` 永远一起出现 | ✅ CP6c-1 完成 |
+| ③ **RAII** | 把 fd 包进一个类，析构函数自动 `close` | ⬜ 以后（C++ 进阶） |
 
-| 阶段 | 手段 |
+**检测手段也在升级：**
+
+| 阶段 | 怎么发现泄漏 |
 | --- | --- |
-| 现在 | **手工配平**：保证每条路径都 `close`（例如"先 `close` 再 `continue`"） |
-| CP6b/CP6c | `close(fd)` 和 `clients.erase(fd)` **永远配对** |
-| 以后（C++ 进阶） | **RAII**：把 fd 包进一个类，析构函数自动 `close` |
-| 现在就能有 | **检测手段**：`ls /proc/<pid>/fd \| wc -l` 看 fd 数量，反复请求 1000 次看它是否增长 |
+| 最早 | 手工 `ls /proc/<pid>/fd \| wc -l`，反复请求 1000 次看它涨不涨 |
+| CP6b 起 | **`tests/cp6b_test.py` 的 `[4]`** —— 自动比对基线，泄漏的实现过不了 |
+| CP6c 起 | ⚠ 多了**第二本账**（账本条目），而 fd 测试**看不见**它 → 靠**哨兵** |
 
-> 自检命令：反复 curl 1000 次后比较 fd 数量 —— 这是最直接的泄漏检测。
+**CP6c 的哨兵（第二本账唯一的报警器）：**
+
+```cpp
+// 主哨兵：放在 emplace 那边，不是 erase 那边！
+if (!clients.emplace(conn_fd, ctx).second) {
+    std::cerr << "账本里已经有 fd=" << conn_fd << " —— 上一个连接漏了 erase" << std::endl;
+}
+```
+
+**为什么必须在 `emplace`**：漏了 `erase` 之后，旧条目还躺在账本里；
+下一个连接复用同一个 fd 时，`erase` 照样能删掉它（返回 1）—— 所以 **`erase` 那边永远喊不出来**。
+
+**实测**：故意删掉一条 `erase` → `cp6b_test.py` **照样 4/4 全绿**（编译也零警告），
+但哨兵报了 **23 次**。**测试看不见的 bug，只有哨兵能抓。**

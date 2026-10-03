@@ -1,16 +1,35 @@
-#include <iostream>       // std::cout / std::endl
-#include <cstdint>        // uint16_t
-#include <cerrno>         // errno / EAGAIN / EWOULDBLOCK / EINTR
-#include <csignal>        // signal / SIGPIPE / SIG_IGN
-#include <sys/socket.h>   // socket / bind / listen / setsockopt / accept / sockaddr
-#include <netinet/in.h>   // sockaddr_in / INADDR_ANY / htons
-#include <cstdio>         // perror
-#include <unistd.h>       // close
-#include <arpa/inet.h>    // inet_ntop
-#include <fcntl.h>        // fcntl / F_GETFL / F_SETFL / O_NONBLOCK
-#include <sys/epoll.h>    // epoll_create1 / epoll_ctl / epoll_wait / struct epoll_event
+#include <iostream>        // std::cout / std::endl
+#include <cstdint>         // uint16_t
+#include <cerrno>          // errno / EAGAIN / EWOULDBLOCK / EINTR
+#include <csignal>         // signal / SIGPIPE / SIG_IGN
+#include <sys/socket.h>    // socket / bind / listen / setsockopt / accept / sockaddr
+#include <netinet/in.h>    // sockaddr_in / INADDR_ANY / htons
+#include <cstdio>          // perror
+#include <unistd.h>        // close
+#include <arpa/inet.h>     // inet_ntop
+#include <fcntl.h>         // fcntl / F_GETFL / F_SETFL / O_NONBLOCK
+#include <sys/epoll.h>     // epoll_create1 / epoll_ctl / epoll_wait / struct epoll_event
+#include <unordered_map>   // std::unordered_map（CP6c：fd → 连接状态）
 
 constexpr uint16_t PORT = 8888;   // 监听端口
+
+// ===========================================================================
+// CP6c：每条连接的状态
+//
+// 为什么需要它？
+//   CP6a / CP6b 里"一条连接"就只是一个 fd 号 —— 连接相关的所有东西都活在
+//   事件处理的【栈帧】里，事件一处理完就烟消云散。
+//   一旦要处理半包 / 粘包（CP5 那套），就必须把"这条连接已经收到哪儿了"存下来，
+//   而栈帧留不住它 → 状态必须从栈上搬到外面的容器里。
+//
+//   这就是"状态机切片"：把"一个连续执行的函数"改造成"每次事件恢复一点进度"，
+//   所以"进度"得有个地方放。
+// ===========================================================================
+struct ClientContext {
+    int fd = -1;
+    // CP6c-2 会加在这里，例如：
+    //     std::string inbuf;   // 这条连接攒到的字节
+};
 
 int main() {
     // 忽略 SIGPIPE：客户端提前断开时 send 不会杀掉整个进程，而是返回 -1 (EPIPE)
@@ -81,6 +100,16 @@ int main() {
 
     std::cout << "epoll ready, listening on port " << PORT << " ..." << std::endl;
 
+    // ---- CP6c：连接账本 ----
+    // fd → 该连接的状态。这是"现在到底有哪些连接活着"的唯一真相来源。
+    //
+    // ⚠ 从这里开始有【两本账】要配平：
+    //     · fd 号     —— 靠 close() 销账
+    //     · 账本条目  —— 靠 erase() 销账
+    //   只 close 不 erase = 内存泄漏；只 erase 不 close = fd 泄漏。两本都得平。
+    //   这就是 HANDOFF §8.3 说的"第二阶段：close / erase 配对"。
+    std::unordered_map<int, ClientContext> clients;
+
     // ---- 步骤 9：事件循环（Reactor 的心脏）----
     constexpr int MAX_EVENTS = 16;
     struct epoll_event events[MAX_EVENTS];
@@ -140,18 +169,33 @@ int main() {
                     // 登记之后，这条分机上的数据到达时，epoll_wait 才会把它报给我们。
                     // data.fd 写 conn_fd：事件回来时，就用这个标记分辨"是哪条分机"。
                     struct epoll_event cev{};
-                    cev.events = EPOLLIN;    // ← 空 2：这条分机，你关心它的什么？
-                    cev.data.fd = conn_fd;   // ← 空 3：标记写谁？
+                    cev.events = EPOLLIN;    // 关心"可读"：对分机就是"对端发数据来了"
+                    cev.data.fd = conn_fd;   // 标记写 conn_fd：事件回来时靠它认出是哪条分机
 
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &cev) < 0) {   // ← 空 4
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &cev) < 0) {
                         perror("epoll_ctl: conn_fd");
                         close(conn_fd);   // 没登记成功就没人管它了，必须自己关掉
                         continue;
                     }
+
+                    // ---- CP6c：把这条连接记进账本 ----
+                    // 放在 epoll_ctl 成功【之后】：前面任何一步失败都已经 close + continue 了，
+                    // 走到这儿才动手，就不用再回头擦屁股。
+                    ClientContext ctx;
+                    ctx.fd = conn_fd;
+                    clients.emplace(conn_fd, ctx);   // ← 空 1：存进账本（把 ______ 换成方法名）
                 }
             } else {
-                // ---- CP6b ③：分机的事件（data.fd != server_fd）----
+                // ---- CP6b ③ / CP6c：分机的事件（data.fd != server_fd）----
                 int fd = events[i].data.fd;
+
+                // ---- CP6c：先从账本里把这条连接找出来 ----
+                // CP6c-1 只要求"查得到、销得掉"，还不用里面的东西；
+                // CP6c-2 才把 inbuf 搬进来真正用上。
+                auto it = clients.find(fd);   // ← 空 2：查找
+                if (it == clients.end()) {    // ← 空 3：和什么比较才算"没找到"？
+                    continue;                 // 账本里没这条 —— 不该发生，跳过别硬来
+                }
 
                 char buf[1024];
                 // 为什么要循环：一次事件只保证"现在有数据可读"，
@@ -163,7 +207,12 @@ int main() {
                     if (n > 0) {
                         send(fd, buf, n, 0);   // 回显：CP4 的 send 在这里第一次被复用
                     } else if (n == 0) {
-                        close(fd);   // ← 空 5：对端【正常关闭】。这里要做两件事，写出来
+                        // read 返回 0 = 对端【正常】关闭（有序关闭，不是 RST）。
+                        // 只 close 就够了，不必显式 EPOLL_CTL_DEL：
+                        // man 7 epoll 说 fd 关闭时会自动从所有 interest list 摘除；
+                        // 显式 DEL 反而有风险 —— fd 号可能已被新连接复用，会误删别人的登记。
+                        close(fd);
+                        clients.end(fd);   // ← 空 4：fd 销了，账本也要销
                         break;
                     } else {
                         if (errno == EINTR) continue;   // 被信号打断：重试，不是错误
@@ -171,7 +220,8 @@ int main() {
                             break;   // 数据读干净了 —— 这是【正常】出口，不是错误
                         }
                         perror("read");   // 其它错误（如 ECONNRESET：对端 RST 强断）
-                        close(fd);        // ← 空 6：出错也要配平
+                        close(fd);
+                        clients.end(fd);   // ← 空 5：这条路径同样两本都要销
                         break;
                     }
                 }

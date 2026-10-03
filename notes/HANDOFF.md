@@ -206,8 +206,15 @@ kill %1
 >
 > **教训：验收标准本身也要被验证 —— 要问"反例能不能通过"。**
 
-**之后的路线**：CP6c 引入 `ClientContext` 把 CP5 的状态机搬进来（`data.fd` → `data.ptr`）
+**之后的路线**：CP6c 引入 `ClientContext` 把 CP5 的状态机搬进来
 → CP6d 加固（`EMFILE` 忙等 / 部分写）→ 然后 day5 线程池
+
+> 📌 CP6c **不换 `data.ptr`**（原先这么写过，重新评估后否掉了）：
+> `data.fd` 保持不变，另加一个 `std::unordered_map<int, ClientContext>` 账本。
+> 理由：分流逻辑一行都不用改；`data.ptr` 还得引入"哨兵"来区分总机（指针没法跟
+> `server_fd` 这个 int 比），而且查不到时 map 能 `continue` 兜住、悬垂指针直接炸。
+> 账本无论如何都要有（所有权 + 谁还活着），那 `ptr` 就只剩"省一次哈希查找"这点收益。
+> 详见 `learning_progress.md` 的 CP6c 小节。
 
 > 📌 曾把"同批陈旧事件"列为 CP6d 的一项，**实测证明在本设计里不存在**
 > （单线程 LT + 不 `dup()`：30000 条连接 / 65240 个事件，陈旧 0 个）。已划掉。

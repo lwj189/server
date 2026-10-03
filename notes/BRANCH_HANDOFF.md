@@ -40,6 +40,30 @@
 - 长回复
 - 抽象说教
 
+### ★ 已验证有效的一招：把中文意图翻成英文
+
+我卡在"STL 方法名怎么猜"上、完全没头绪时，这招一下通了：
+
+```bash
+# 一条命令列出容器的所有方法名（30 个左右，全是英文单词）
+H=/usr/include/c++/15/bits/unordered_map.h
+grep -oP "^      \K[a-z_]+(?=\()" "$H" | sort -u
+```
+
+| 中文 | 英文 |
+| --- | --- |
+| 找 | `find` |
+| 删 | `erase` / `clear` |
+| 加 | `insert` / `emplace` |
+| 末尾 | `end` |
+| 几个 | `size` / `count` |
+| 空吗 | `empty` |
+
+**方法名不是密码，就是英文单词。** 流程：列方法名 → 翻英文 → 数参数个数 → 编译验证。
+
+**配合的坑**：`end()` 和 `end(fd)` 是两个完全不同的东西（后者是"第 fd 号**桶**的末尾"），
+只差两个字母，而且**编译不报错**。详见第五节第 4 条。
+
 ---
 
 ## 二、这一段做完了什么
@@ -65,9 +89,16 @@ std::unordered_map<int, ClientContext> clients;           // 第 111 行
 
 ### 顺手做的
 
-- CI 纳入 `epoll.cpp` + `cp6b_test.py`（串行跑，避开 8888 冲突）
-- 笔记四件事：`2const` / 英文句型表 / `EPOLLIN` 两种含义 / 配平 + EMFILE
+- CI 纳入 `epoll.cpp` + `cp6b_test.py`（**串行**跑，避开 8888 冲突；一套失败不影响另一套）
+- 笔记四件事：`2const` 分节 / 英文句型表 / `EPOLLIN` 两种含义 / 配平 + EMFILE
 - HANDOFF §7 的"假绿"教训固化
+- **笔记大扫除**（发现"假绿"判据在两个文件里各写了一遍，改一处不够）：
+  - `epoll_notes.md` §9 那条假绿判据换掉；路线图同步到 CP6c-1；
+    §10 速查表 `epoll_event` → `man 3type epoll_event`；
+    §11.3 改成"分阶段收敛"表 + 哨兵实测；标题 `CP6a 起` → `CP6a ~ CP6c`
+  - `learning_progress.md` §五「接下来做什么」整段重写（**第二条假绿判据在这**）；
+    自检问题 **36 问 → 50 问**（CP6b 加 8 问、CP6c 加 6 问）
+  - `HANDOFF.md` §3 项目地图补上 `BRANCH_HANDOFF.md` 和 `date.txt`
 
 ---
 
@@ -84,8 +115,19 @@ epoll.cpp   约 246 行
 tests/cp6b_test.py   4 项，全绿
 tests/p2_test.py     23 项，测的是 p2.cpp
 
-git: main 已推到 origin，包含 CP6b + notes + CI + docs + CP6c-1
-⚠ 推不了命令行（没凭证），要用 VS Code 的"同步更改"
+git: 分支 main
+     这一段产生的 8 个提交（从旧到新）：
+       a9e7494  CP6b（代码 + cp6b_test.py）
+       3138f4f  notes 四件事
+       30286f2  CI 纳入 epoll（串行）
+       aaa9c43  docs: 划掉"同批陈旧事件"
+       5392991  CP6c-1（5 个空）
+       68eb715  修 end → erase
+       55a9b73  加哨兵
+       286ca4b  notes: 清掉两处"假绿"判据
+     自己看状态：`git log --oneline -8` 和 `git status`
+⚠ 命令行推不了（没凭证：无 credential.helper / token / gh 未登录）——
+   用 VS Code 的"同步更改"按钮
 ```
 
 ### 两处哨兵（CP6c-1 的重要产出）
@@ -183,12 +225,25 @@ if (!clients.emplace(conn_fd, ctx).second) {
 
 ---
 
-## 七、五个笔记文件的分工
+## 七、笔记文件的分工（`notes/` 下 6 个）
 
 | 文件 | 作用 |
 | --- | --- |
 | `HANDOFF.md` | 给新对话的**第一份**文件（我是谁 / 怎么教我 / 项目现状 / 踩过的坑） |
-| `learning_progress.md` | **主线进度**：各 CP 小节 + 方法论 + 概念清单 |
-| `epoll_notes.md` | **epoll 专题**：API + 概念 + 坑 + 速查表（止于 CP6a） |
+| `learning_progress.md` | **主线进度**：各 CP 小节 + 方法论 10 条 + 概念清单 + 自检问题 50 问 |
+| `epoll_notes.md` | **epoll 专题**：API + 概念 + 坑 + 速查表（现在覆盖 CP6a ~ CP6c） |
 | `pitfalls.md` | **最细的踩坑记录**（CP1~CP4，症状速查表 + 命令小抄） |
+| `BRANCH_HANDOFF.md` | **本文件**：某个分支对话的交接 |
 | `date.txt` | **最早的一次性产物**：CP1 伪代码骨架 + JMeter 压测原始数据 |
+
+**怎么配合用**：主对话先读 `HANDOFF.md`，再读这份 `BRANCH_HANDOFF.md`，
+需要 epoll 细节时翻 `epoll_notes.md`，报错了按症状查 `pitfalls.md`。
+
+---
+
+## 八、给主对话的一句话
+
+> CP6b 和 CP6c-1 都做完了，`epoll.cpp` 是一个**能跑的、带两本账和哨兵的 echo 服务器**。
+> 下一步是 **CP6c-2**：把 CP5 的状态机搬进 `ClientContext`，
+> 验收标准从 `cp6b_test.py` 4/4 换成 **`p2_test.py` 23 项全绿**。
+> 摆骨架时记得：**关键的空留给我填，你把骨架连同下划线一起放进文件**。

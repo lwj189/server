@@ -212,7 +212,7 @@ int main() {
                         // man 7 epoll 说 fd 关闭时会自动从所有 interest list 摘除；
                         // 显式 DEL 反而有风险 —— fd 号可能已被新连接复用，会误删别人的登记。
                         close(fd);
-                        clients.end(fd);   // ← 空 4：fd 销了，账本也要销
+                        clients.erase(fd);   // ← 空 4：fd 销了，账本也要销
                         break;
                     } else {
                         if (errno == EINTR) continue;   // 被信号打断：重试，不是错误
@@ -221,7 +221,7 @@ int main() {
                         }
                         perror("read");   // 其它错误（如 ECONNRESET：对端 RST 强断）
                         close(fd);
-                        clients.end(fd);   // ← 空 5：这条路径同样两本都要销
+                        clients.erase(fd);   // ← 空 5：这条路径同样两本都要销
                         break;
                     }
                 }

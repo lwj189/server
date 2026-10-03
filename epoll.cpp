@@ -183,7 +183,20 @@ int main() {
                     // 走到这儿才动手，就不用再回头擦屁股。
                     ClientContext ctx;
                     ctx.fd = conn_fd;
-                    clients.emplace(conn_fd, ctx);   // ← 空 1：存进账本（把 ______ 换成方法名）
+                    // ---- CP6c：存进账本（这里才是第一道哨兵）----
+                    // emplace 返回 pair<iterator, bool>，那个 bool = "到底插进去了没有"。
+                    // key 已存在时它【静默不插】—— 而 fd 号会被复用，
+                    // 所以 false 就意味着：上一个用这个号码的连接没销账。
+                    //
+                    // ⚠ 为什么哨兵必须放这儿、不能只放在 erase 那儿：
+                    //   漏了 erase 之后，这个 fd 的旧条目【还躺在账本里】，
+                    //   下一个连接复用同一个号码时，erase 照样能删掉它（返回 1）——
+                    //   所以 erase 那边永远等不到"删不到"的情况，喊不出来。
+                    //   只有 emplace 这一侧才知道"这个号码不该有人占着"。
+                    if (!clients.emplace(conn_fd, ctx).second) {
+                        std::cerr << "账本里已经有 fd=" << conn_fd << " —— 上一个连接漏了 erase"
+                                  << std::endl;
+                    }
                 }
             } else {
                 // ---- CP6b ③ / CP6c：分机的事件（data.fd != server_fd）----
@@ -212,7 +225,16 @@ int main() {
                         // man 7 epoll 说 fd 关闭时会自动从所有 interest list 摘除；
                         // 显式 DEL 反而有风险 —— fd 号可能已被新连接复用，会误删别人的登记。
                         close(fd);
-                        clients.erase(fd);   // ← 空 4：fd 销了，账本也要销
+                        // fd 销了，账本也要销 —— 两本账必须一起平。
+                        //
+                        // 为什么要写成 if：erase 返回"删掉了几个"（只能是 0 或 1）。
+                        // 返回 0 = 账本里【本来就没有】这条 —— 那必然是别的地方漏销账了。
+                        //
+                        // 这是【故意加的哨兵】：漏 erase 时，fd 数是平的、cp6b_test.py
+                        // 4/4 全绿、编译零警告 —— 只有这里会喊出来。
+                        if (clients.erase(fd) == 0) {
+                            std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账" << std::endl;
+                        }
                         break;
                     } else {
                         if (errno == EINTR) continue;   // 被信号打断：重试，不是错误
@@ -221,7 +243,10 @@ int main() {
                         }
                         perror("read");   // 其它错误（如 ECONNRESET：对端 RST 强断）
                         close(fd);
-                        clients.erase(fd);   // ← 空 5：这条路径同样两本都要销
+                        // 这条路径同样两本都要销（哨兵作用和上面那个一样，见上）
+                        if (clients.erase(fd) == 0) {
+                            std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账" << std::endl;
+                        }
                         break;
                     }
                 }

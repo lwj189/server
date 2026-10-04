@@ -1,4 +1,4 @@
-# epoll 学习笔记（CP6a ~ CP6c）
+# epoll 学习笔记（CP6a ~ CP6d）
 
 > 来源：合并自两个分支会话的问答 —— epoll1（钻 API 细节）+ epoll2（问概念工程）。
 > 这是一份 **查阅型笔记**：以后遇到同样的问题直接翻这里，不用再问一遍。
@@ -240,7 +240,104 @@ while (true) {
 | **CP6b** | 把 **client fd 纳入 epoll**（设非阻塞 + `EPOLL_CTL_ADD`），事件循环里区分 `server_fd` / client fd | ✅ 完成（`a9e7494`） |
 | **CP6c-1** | 引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**） | ✅ 完成（`5392991`） |
 | **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应（`inbuf` + `tryHandleRequest`） | ✅ 完成（验收：`p2_test.py` 23/23 对着 `./epoll`） |
-| **CP6d** | 加固：`EMFILE` 忙等、部分写、粘包 / keep-alive | ▶ 下一步 |
+| **CP6d-1** | 加固①：`EMFILE` 忙等 —— 撞 fd 上限后**暂停接收**而不是空转 | ✅ 完成（验收：`emfile_test.py` 2/2） |
+| **CP6d-2** | 加固②：**keep-alive** —— 一条连接服务多个请求 | ✅ 完成（验收：`keepalive_test.py` 7/7） |
+| **CP6d-3** | 加固③：**部分写**（`send` 返回 < n → 输出缓冲 + `EPOLLOUT`） | ⬜ 下一步（现在撞不到，见下） |
+
+### CP6d-1：`EMFILE` —— "接不了新连接"时该怎么办
+
+**这不是"处理一个错误码"，是"处理一个状态"。**
+
+坏版本实测（`ulimit -n 64`，fd 灌满后静置）：
+
+| | 数字 |
+| --- | --- |
+| `EMFILE` 触发 | **2,052,391 次** |
+| CPU | **67~75%，状态 `R`**（一直在跑，不是在睡） |
+| 3 秒日志 | **+1,626,534 行**（≈43 MB，同一个文件 append） |
+| **已经在线的用户** | **`TimeoutError: timed out`** ← 连它们也服务不了 |
+
+**死循环怎么来的**：`accept` 返回 `EMFILE` → `break` → 回 `epoll_wait` →
+**但 `server_fd` 还在 epoll 里、accept 队列里还排着人 → 它依然"可读"** → 立刻又返回 →
+又 `accept` → 又 `EMFILE`…… 中间**没有任何等待**，因为条件永远成立。
+
+**解法（暂停 / 恢复）**：
+
+```cpp
+if (errno == EMFILE) {                    // per-process（ENFILE 才是整机）
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, server_fd, &ev);   // 把话筒摘了
+    accept_paused = true;
+    paused_at     = clients.size();       // 记下暂停那一刻的账本大小
+    break;
+}
+// 每轮 epoll_wait 【之前】问一句：账本比暂停时小了吗？（= 腾出 fd 了吗）
+if (accept_paused && clients.size() < paused_at) {
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);   // 把话筒放回去
+    accept_paused = false;
+}
+```
+
+三个**不能动**的点：
+
+| 点 | 错了会怎样 |
+| `errno == EMFILE` | 写成 `ENFILE`（整机上限）→ 永远进不来这个分支，**空转照旧**（实测日志 109 万行） |
+| 恢复判断放在 `epoll_wait` **之前** | 放在"刚暂停那一轮"的末尾 → 同一轮里 `暂停 → 恢复 → 再暂停`，**又变回死循环** |
+| `paused_at = clients.size()` | 填 `0` → `size_t` 无符号，`size() < 0` 永远不成立 → **摘了话筒再也放不回去**（实测 `[2] FAIL 连不上`，而 `[1]` 照样绿 —— 所以要两个用例） |
+
+**这个坑和 `EAGAIN` 是同一个形状**：非阻塞 fd 上"现在做不了"时，
+**正确反应都是"去等一个事件"，而不是"原地重试"**。
+
+### CP6d-2：keep-alive —— 一条连接服务多个请求
+
+| | 现在（`Connection: close`） | keep-alive |
+| --- | --- | --- |
+| 一个连接服务几个请求 | **1 个** | 多个 |
+| 200 个请求留下的 `TIME_WAIT` | **402 个**（每个 2 个，各占 60 秒） | 2 个 |
+| 握手次数 | 每个请求 1 次 | 总共 1 次 |
+
+**改动就三处**（都在 `tryHandleRequest` 和它的调用处）：
+
+1. `ClientContext` 加 `bool want_close = false;` —— 第三个状态："回完这个请求要不要挂断"
+2. 读完 `Connection` 头决定它（值可能是 `close` / `keep-alive` / `Close`… → 先 `toLowerAscii` 再比）
+3. **处理完一个请求就 `ctx.inbuf.erase(0, total)`** —— 把用掉的字节消费掉
+
+**为什么第 3 步不能省**：不删的话，下次事件进来 `find("\r\n\r\n")` **又找到同一个请求** →
+把它再回一遍，排在后面的请求永远轮不到。
+
+**调用处要循环**（这是"粘包"的另一半）：
+
+```cpp
+while (tryHandleRequest(ctx)) {       // true = 处理掉了一个；false = 还不够
+    if (ctx.want_close) { close(fd); clients.erase(fd); gone = true; break; }
+    // 不关 → 回 while 顶部：inbuf 里可能还躺着下一个请求
+}
+```
+
+> ⚠ **坑**：`bool want_close = true;` 是**新建一个局部变量**（行首有类型 = 声明），
+> 改不到 `ctx` 里的成员；`ctx.want_close = true;` 才是赋值。
+> 编译器**只给 warning**（`unused variable`），因为"声明一个没用过的变量"是合法语句。
+> **对警告不能当噪音。**
+
+> ⚠ **坑**：读 `Connection` 时**别整段照抄**读 `Content-Length` 的代码。
+> 两者只有前半截像（都是 `findHeader` 取值），后半截完全不同 ——
+> 那个要 `isAllDigits` / `stoull` / `MAX_BODY_SIZE`（**把数字串转成整数**），
+> 这个只要**比字符串**。抄多了的后果：日志刷 109 万行 `Connection 非法（不是纯数字）`。
+> **"照抄形状"可以，但抄进来的每一行都得知道在干嘛。**
+
+**`Connection` 头的规范依据**：RFC 9112 讲 Tear-down 的那一节（`Connection: close` 表示回完就关）。
+HTTP/1.1 **默认是复用**，所以"没写这个头"= 继续保持。
+
+### CP6d-3：部分写为什么现在不动
+
+| | 字节数 |
+| --- | --- |
+| 一次响应 | **117** |
+| 内核发送缓冲区 | **16384** |
+
+117 ≪ 16384 → **撞不到**。按 TDD 规矩"**写不出会红的测试，就别改代码**"，
+等响应变大 / 长连接压测时再回来（那时要加输出缓冲 + `EPOLLOUT`）。
+
+**部分写本身是真的**（实测：想 `send` 1048576 字节 → 第一次只出去 **32741**，第二次 **47616**，第三次 `EAGAIN`）。
 
 **CP6b 的验收**：当时的 `cp6b_test.py` → **4/4 全绿**
 （[1] echo / [2] 分多次到达 / [3] 并发不串台 / [4] **fd 配平**）

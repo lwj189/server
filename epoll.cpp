@@ -46,6 +46,14 @@ struct ClientContext {
     // （p2.cpp 里它是 main 循环里的一个局部 std::string，一次只服务一条连接，
     //   所以放栈上够用；epoll 版同时持有很多条，就必须一人一个。）
     std::string inbuf;
+
+    // ---- CP6d 新增：这条连接【回完当前请求之后】要不要关？----
+    // 谁说了算：客户端在请求头里说（去看 tests/p2_test.py 第 45 行，它带了什么字段）。
+    // 出错的连接也必须关（头过大 / Content-Length 非法 …），也是靠这个成员。
+    //     true  = 该关了（客户端要求，或这条连接被判为非法）
+    //     false = 留着，继续服务后面的请求（HTTP/1.1 的默认行为）
+    //
+    bool want_close = false;
 };
 
 // ===========================================================================
@@ -121,15 +129,15 @@ static bool isAllDigits(const std::string& s) {
 // ===========================================================================
 static bool tryHandleRequest(ClientContext& ctx) {
     // ---- ① 头部定界：找 \r\n\r\n（RFC 9112 §2.1）----
-    const size_t header_end = ctx.inbuf.find("\r\n\r\n");   // ← 空 1：定界符是什么？
-    if (header_end == std::string::npos) {                  // ← 空 2：没找到时 find 返回什么？
+    const size_t header_end = ctx.inbuf.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
         // 头部还没收全。但别无限等 —— 对方可能永远不发定界符（DoS）。
         // ⚠ 判断顺序和 p2.cpp 一致：先看"收全没有"，再看"超限"。
         //   反过来会把"头很小但 body 很大"的合法请求误杀。
         if (ctx.inbuf.size() > MAX_HEADER_SIZE) {
             std::cout << "请求头过大 —— 丢弃 fd=" << ctx.fd << std::endl;
-            // 想想：true 表示"这条连接有结果了，调用方可以收掉它"
-            return true;   // ← 空 3
+            ctx.want_close = true;   // 判死刑的连接一律要关（下面 3 处错误分支同理）
+            return true;
         }
         return false;   // 还不够，等下次事件
     }
@@ -140,6 +148,7 @@ static bool tryHandleRequest(ClientContext& ctx) {
     if (findHeader(ctx.inbuf, header_end, "Content-Length", cl_value)) {
         if (!isAllDigits(cl_value)) {
             std::cout << "Content-Length 非法（不是纯数字）—— 丢弃 fd=" << ctx.fd << std::endl;
+            ctx.want_close = true;
             return true;
         }
         try {
@@ -147,18 +156,34 @@ static bool tryHandleRequest(ClientContext& ctx) {
             if (v > MAX_BODY_SIZE) {
                 std::cout << "body 过大（Content-Length=" << v << "）—— 丢弃 fd=" << ctx.fd
                           << std::endl;
+                ctx.want_close = true;
                 return true;
             }
             content_len = static_cast<size_t>(v);
         } catch (const std::exception&) {
             std::cout << "Content-Length 溢出 —— 丢弃 fd=" << ctx.fd << std::endl;
+            ctx.want_close = true;
             return true;
         }
     }
 
+    // ---- 客户端要不要关连接？（HTTP/1.1 默认复用，客户端说 close 才关）----
+    // 位置讲究：必须在【拼响应之前】问出来，因为响应里的 Connection 头要跟着它走。
+    //
+    // ⚠ 和上面找 Content-Length 只有【前半截】像（都是 findHeader 取值），后半截完全不同：
+    //   那个要"把数字串转成整数"（isAllDigits / stoull / MAX_BODY_SIZE），
+    //   这个只要"比字符串"。照抄形状可以，抄进来的每一行都得知道在干嘛。
+    //
+    // 值可能是 "close" / "keep-alive" / "Close"… → 先 toLowerAscii 再比（RFC 9110 §5.1 大小写不敏感）
+    std::string conn_value;
+    if (findHeader(ctx.inbuf, header_end, "Connection", conn_value) &&
+        toLowerAscii(conn_value) == "close") {
+        ctx.want_close = true;
+    }
+
     // ---- ③ 一个完整请求 = 头部 + 结尾空行 + body，一共多少字节？----
     //     header_end 指向 "\r\n\r\n" 的【第一个 \r】，头部内容本身不含这 4 个字节。
-    const size_t total = header_end + 4 + content_len;   // ← 空 4
+    const size_t total = header_end + 4 + content_len;
 
     // ---- ④ 收齐了没有？----
     // 没齐就原地返回 —— 这一行就是"切片"：
@@ -173,19 +198,29 @@ static bool tryHandleRequest(ClientContext& ctx) {
               << request << std::endl;
 
     const std::string body = "<h1>Hello from my own server!</h1>";
+    // 响应里的 Connection 头跟着 ctx.want_close 走 —— 这一处我写好了，不用你填
+    const std::string conn_header = ctx.want_close ? "Connection: close\r\n"
+                                                   : "Connection: keep-alive\r\n";
     const std::string response = "HTTP/1.1 200 OK\r\n"
                                  "Content-Type: text/html\r\n"
                                  "Content-Length: " +
                                  std::to_string(body.size()) +
-                                 "\r\n"
-                                 "Connection: close\r\n"
+                                 "\r\n" +
+                                 conn_header +
                                  "\r\n" +
                                  body;
 
     if (send(ctx.fd, response.c_str(), response.size(), 0) < 0) {
         perror("send");
     }
-    return true;   // 响应已发（Connection: close 语义）→ 调用方收掉这条连接
+
+    // ---- 把【已经处理掉】的字节从 inbuf 里删掉（消费）----
+    // 不删会怎样：下次事件进来 find("\r\n\r\n") 又会找到【同一个请求】→ 又回一遍，
+    //             排在后面的请求永远轮不到。（判据：keepalive_test 的 [2]）
+    // 删完剩下的才是"还没处理的字节"，下一个请求就排在它前面。
+    ctx.inbuf.erase(0, total);
+
+    return true;   // 我处理掉了一个请求（后面还有没有，调用方接着问）
 }
 
 int main() {
@@ -267,11 +302,36 @@ int main() {
     //   这就是 HANDOFF §8.3 说的"第二阶段：close / erase 配对"。
     std::unordered_map<int, ClientContext> clients;
 
+    // ---- CP6d：EMFILE 暂停状态 ----
+    // 为什么要它：accept 撞到 EMFILE（fd 用光）后如果只是 break，
+    // LT 模式下监听 fd 仍然"可读" → epoll_wait 立刻又返回 → 死循环烧 CPU。
+    // 实测：3 秒刷了 161 万行 "accept: Too many open files"，CPU 100%。
+    // 办法：暂停时把 server_fd 从 epoll 里【摘掉】；等有连接关闭、fd 腾出来，再【加回去】。
+    bool accept_paused = false;
+    size_t paused_at = 0;   // 暂停那一刻账本里有几条（后面拿它判断"有没有腾出 fd"）
+
     // ---- 步骤 9：事件循环（Reactor 的心脏）----
     constexpr int MAX_EVENTS = 16;
     struct epoll_event events[MAX_EVENTS];
 
     while (true) {
+        // ---- CP6d：先看看能不能恢复接收 ----
+        // 判据：暂停时账本有 paused_at 条，现在少了 → 至少腾出了一个 fd。
+        //
+        // ⚠ 位置：必须在这个 while 循环【里面】。
+        //   实测（造变体验的）：放循环外 → 这段永远不执行 → 摘了话筒再也放不回去 → [2] 报"连不上"。
+        //   放这里 vs 放循环体【末尾】：实测【等价】，两个都 2/2。
+        //   （原来这行注释写的是"放末尾会 暂停→恢复→再暂停 又变死循环" —— 那是个
+        //    没验证过的猜测，已被实测推翻。留在这里只是因为语义更清楚：）
+        // ★ "能不能恢复"是【睡前】要问的问题 —— 先问，再睡。
+        if (accept_paused && clients.size() < paused_at) {
+            // 加回去。用的还是当初登记 server_fd 时那个 event（它还在作用域里）
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == 0) {
+                accept_paused = false;
+                std::cout << "fd 腾出来了 —— 恢复接收新连接" << std::endl;
+            }
+        }
+
         // 返回值三态：>0 就绪的 fd 个数 / 0 超时（不是错误）/ -1 出错
         // timeout = -1：没有事件就一直睡（实测 0% CPU，wchan=ep_poll）
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -296,6 +356,15 @@ int main() {
 
                     if (conn_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;   // 接完了
+                        if (errno == EMFILE) {   // 本【进程】的 fd 用光了（ENFILE 才是整机）
+                            std::cerr << "fd 用光了 —— 暂停接收，等连接释放" << std::endl;
+                            // 把它从 epoll 摘掉，别再收它的事件 —— 摘了才不会空转。
+                            // （EPOLL_CTL_DEL 的 event 参数会被内核忽略，传什么都不会读）
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, server_fd, &ev);
+                            accept_paused = true;
+                            paused_at = clients.size();   // 记下暂停时的账本大小（恢复判据比它小）
+                            break;
+                        }
                         perror("accept");
                         break;
                     }
@@ -316,7 +385,7 @@ int main() {
                         close(conn_fd);   // 失败也要配平，否则就是一条 fd 泄漏
                         continue;
                     }
-                    if (fcntl(conn_fd, F_SETFL, cflags | O_NONBLOCK) == -1) {   // ← 空 1
+                    if (fcntl(conn_fd, F_SETFL, cflags | O_NONBLOCK) == -1) {
                         perror("fcntl F_SETFL conn");
                         close(conn_fd);
                         continue;
@@ -359,11 +428,11 @@ int main() {
                 // ---- CP6b ③ / CP6c：分机的事件（data.fd != server_fd）----
                 int fd = events[i].data.fd;
 
-                // ---- CP6c：先从账本里把这条连接找出来 ----
-                // CP6c-1 只要求"查得到、销得掉"，还不用里面的东西；
-                // CP6c-2 才把 inbuf 搬进来真正用上。
-                auto it = clients.find(fd);   // ← 空 2：查找
-                if (it == clients.end()) {    // ← 空 3：和什么比较才算"没找到"？
+                // ---- 先从账本里把这条连接找出来 ----
+                // 账本 = fd → 这条连接的状态。找不到说明不该发生（登记和销账没配平），
+                // 这时 continue 兜住即可 —— 绝不能拿着一个空的 ctx 硬来。
+                auto it = clients.find(fd);
+                if (it == clients.end()) {
                     continue;                 // 账本里没这条 —— 不该发生，跳过别硬来
                 }
 
@@ -383,19 +452,29 @@ int main() {
                         // 是 append 不是 = ：一段一段往上接，这就是半包/粘包的落脚点。
                         ctx.inbuf.append(buf, static_cast<size_t>(n));
 
-                        // 每读完一段都问一句："现在够一个完整请求了吗？"
-                        if (tryHandleRequest(ctx)) {
-                            // 有结果了（响应已发，或这条连接被判为非法）→ 收掉它。
-                            // 两本账一起销：fd 靠 close，账本条目靠 erase。
-                            close(fd);
-                            if (clients.erase(fd) == 0) {
-                                std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账"
-                                          << std::endl;
+                        // ---- 一个连接可能有好几个请求：循环解析 ----
+                        // tryHandleRequest 的意思：
+                        //     true  = 我处理掉了一个完整请求（已经 erase 掉了）
+                        //     false = 还不够一个完整请求
+                        // 所以要【循环】问它，直到问不出请求为止 ——
+                        // 一次 read 可能把两个请求一起收进来（粘包），
+                        // 不循环的话第二个就永远躺在 inbuf 里没人管。
+                        bool gone = false;
+                        while (tryHandleRequest(ctx)) {
+                            // 每处理完一个就问一句：这条连接该收了吗？
+                            if (ctx.want_close) {
+                                // 两本账一起销：fd 靠 close，账本条目靠 erase
+                                close(fd);
+                                if (clients.erase(fd) == 0) {
+                                    std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账"
+                                              << std::endl;
+                                }
+                                gone = true;
+                                break;
                             }
-                            break;
+                            // 不用关 → 回到 while 顶部，看 inbuf 里还有没有下一个请求
                         }
-                        // 不够一个完整请求：什么都不做，回到 while 顶部继续 read 到 EAGAIN。
-                        // 攒下的字节留在 ctx.inbuf 里，等下一个 EPOLLIN 事件再接着算。
+                        if (gone) break;   // 连接已经收了 → 跳出 read 循环
                     } else if (n == 0) {
                         // read 返回 0 = 对端【正常】关闭（有序关闭，不是 RST）。
                         // 只 close 就够了，不必显式 EPOLL_CTL_DEL：

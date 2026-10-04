@@ -14,14 +14,24 @@
 
 ```
 day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5a ✅ → CP5b ✅
-        → 修 3 个解析问题 ✅ → day4：CP6a ✅ → CP6b ⬜ ← 下一步
+   → 修 3 个解析问题 ✅ → day4：CP6a ✅ → CP6b ✅ → CP6c-1 ✅ → CP6c-2 ✅
+   → CP6d 加固：EMFILE 忙等 ✅ / keep-alive ✅ / 部分写 ⬜ ← 下一步
 ```
 
 练习文件：`p2.cpp`（自己手写，**阻塞版**，CP1~CP5）
-　　　　　`epoll.cpp`（**day4 练习**，CP6a 完成，还没接管客户端）
-自动化验收：`tests/p2_test.py` —— **13 个用例 / 23 项检查，当前全绿**
+　　　　　`epoll.cpp`（**day4 练习**，事件驱动 HTTP 服务器，511 行）
+自动化验收 —— **4 套脚本 / 共 36 项检查，当前全绿**：
 
-一句话现状：**`p2.cpp` 是一个能扛住各种异常客户端的 HTTP 服务器（阻塞式，一次一条连接）；`epoll.cpp` 刚跑通事件循环（空闲时睡在 `ep_poll` 里、0% CPU），但客户端 fd 还没纳进来。**
+| 脚本 | 测什么 | 结果 |
+| --- | --- | --- |
+| `tests/p2_test.py` | 【协议正确性】对 `p2` 和 `epoll` 都跑 | 23/23 |
+| `tests/balance_test.py` | 【资源配平】fd + 账本两本账 | 4/4 |
+| `tests/keepalive_test.py` | 【协议】keep-alive / 粘包 / `close` 回归 | 7/7 |
+| `tests/emfile_test.py` | 【健壮性】fd 撞上限后不许空转 | 2/2 |
+
+一句话现状：**`epoll.cpp` 已经是一个事件驱动的 HTTP 服务器** —— 单线程同时持有多条连接、
+能正确分帧、能复用连接（keep-alive）、fd 撞上限会暂停接收而不是空转。
+`p2.cpp` 保留为**阻塞版对照组**（同样的 HTTP 逻辑，一次只服务一条连接）。
 
 ---
 
@@ -634,10 +644,25 @@ grep -oP "^      \K[a-z_]+(?=\()" "$H" | sort -u
       · ⚠ 踩到的：`total` 只写 `header_end + 4`（漏了 `+ content_len`）→ 编译器警告
         `content_len set but not used`，测试 **17/23**、6 个失败全是"**提前响应**"
       · 副产物：`tests/balance_test.py`（原 `cp6b_test.py`）—— 见下面「两个轴」一节
-- [ ] **CP6d**：加固 ← **下一步**
-      · `EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下会空转烧 CPU
-      · 部分写 —— `send` 返回 < n 时要有输出缓冲 + `EPOLLOUT`
-      · 粘包 / keep-alive（配套：循环解析、`inbuf.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
+- [x] **CP6d-1**：`EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下空转烧 CPU
+      · 实测坏版本：**2 秒新增 1,098,114 行日志**、CPU 75%、**连已经连上的用户都超时**
+      · 做法：撞墙时 `EPOLL_CTL_DEL` 把 `server_fd` 从 epoll **摘掉**（不再收它的事件），
+        等 `clients.size() < paused_at`（有连接释放、fd 腾出来了）再 `EPOLL_CTL_ADD` 加回去
+      · 三个关键点：① `errno == EMFILE`（**per-process**，不是 `ENFILE` 整机）
+        ② 恢复判断必须放在 `epoll_wait` **之前**（否则同一轮里 暂停→恢复→再暂停，还是死循环）
+        ③ `paused_at` 记"暂停那一刻的账本大小" —— **契约和恢复判据是一对，改一个另一个就废**
+      · 验收：`tests/emfile_test.py` **2/2**（坏版本新增 109 万行 → 好版本 **新增 0 行**）
+- [x] **CP6d-2**：keep-alive —— 一条连接服务多个请求
+      · 为什么值得做：打开一个网页 = 14 个请求。实测发 200 个请求留下
+        **402 个 TIME_WAIT**（每个请求 2 个、各占 60 秒）；keep-alive 只要 2 个
+      · 做法：`ClientContext` 加 `bool want_close`；处理完一个请求后
+        **`ctx.inbuf.erase(0, total)`** 消费掉已处理的字节（不删会把同一个请求回两遍）；
+        读 `Connection` 头决定关不关；调用处 `while (tryHandleRequest(ctx))` **循环解析**
+      · 验收：`tests/keepalive_test.py` **7/7**（分两次发 / 粘包一次发 / `Connection: close` 回归）
+- [ ] **CP6d-3**：部分写 —— `send` 返回 < n 时要有输出缓冲 + `EPOLLOUT` ← **下一步**
+      · ⚠ 现在**撞不到**：一次响应 117 字节 ≪ 发送缓冲区 16384 字节
+      · 按 TDD 规矩"**写不出会红的测试就别改代码**" → 等响应变大 / 长连接压测时再回来
+- [ ] **idle 超时**：keep-alive 的配套 —— 对端不关也不发时，连接会一直占着 fd
 - [ ] `day5.cpp`：`epoll` + 线程池（用 **C++11 并发库**：`std::thread`/`mutex`/`condition_variable`）；注意 fd 所有权交接的竞态
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
 - [ ] **粘包 / keep-alive**：等 CP6d 一起做（配套：`inbuf.erase` 消费已处理字节、按请求决定是否关闭、idle 超时）
@@ -738,6 +763,22 @@ grep -oP "^      \K[a-z_]+(?=\()" "$H" | sort -u
 58. `ClientContext& ctx = it->second;` 里那个 `&` **去掉**会怎样？为什么这类 bug 特别难查？
 59. 为什么 `cp6b_test.py` 的 [1][2][3] 在 CP6c-2 后**自动失效**了，而 [fd 配平] 没有？
 
+**CP6d-1（EMFILE 忙等）**
+
+60. `EMFILE` 和 `ENFILE` 分别是什么？为什么 `ulimit -n` 撞出来的是前者？
+61. 撞到 `EMFILE` 后**为什么不能只是 `break`**？（提示：LT 模式下那个 fd 还是"可读"的）
+62. 把 `server_fd` 从 epoll 摘掉，为什么就能止住空转？摘掉之后 `epoll_wait` 在等什么？
+63. 恢复判断**为什么必须放在 `epoll_wait` 之前**？放在"刚暂停那一轮"的末尾会怎样？
+64. `paused_at` 为什么必须记"暂停那一刻的 `clients.size()`"？填 `0` 会出什么事？
+
+**CP6d-2（keep-alive）**
+
+65. `ctx.inbuf.erase(0, total)` 不写会怎样？为什么表现是"同一个请求被回了两遍"？
+66. `bool want_close = true;` 和 `ctx.want_close = true;` 差在哪？为什么编译器只给 warning？
+67. 读 `Connection` 头的代码，为什么**不能**照抄读 `Content-Length` 那一整段？
+68. 一条连接上来了两个请求，`tryHandleRequest` 为什么要被**循环调用**？
+69. 现在服务器靠什么"规避"粘包？代价是什么？
+
 ### 两个轴：协议正确性 vs 资源配平
 
 | | 测什么 | 脚本 |
@@ -759,5 +800,6 @@ grep -oP "^      \K[a-z_]+(?=\()" "$H" | sort -u
 | **假绿** | 判据对"要测的那件事"不敏感，坏实现照样过 | "3 个 nc 看到 fd 5/6/7" —— 泄漏版同样打印 5、6、7 |
 | **假绿 · 进阶** | **判据量错了对象** | `balance_test` 对着残留的旧服务器跑，`--pid` 指向新进程却全绿 → 已加"pid 必须是端口监听者"校验 |
 | **假红** | 判据读了一个**会变的量** | fd 基线在服务器还没回收完连接时拍了快照 → 报出"多了 -2 个"这种负数 → 改成"等稳定后再读" |
+| **假绿 · 又一次** | 判据**分不清两个相同的输入** | CP6d-2 的 keep-alive 测试第一版：用两个**一模一样**的请求，于是"服务器把第一个回了两遍、压根没看第二个"也照样全绿 → 改成 `/first` + `/second` 两个不同路径，并**读服务器日志**确认两个都真被处理了 |
 
 **结论：判据也要被验证 —— 要问"反例能不能通过"（抓假绿）、"好实现会不会被误杀"（抓假红）。**

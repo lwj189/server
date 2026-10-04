@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-test:
-    name: 严格编译 + 测试（p2 23 项 / epoll 23 项 + 配平 4 项）
+    name: 严格编译 + 测试（p2 23 / epoll 23+4 / keepalive 7 / emfile 2）
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -112,4 +112,17 @@ jobs:
           run_one p2    tests/p2_test.py
           run_one epoll tests/p2_test.py tests/balance_test.py
 
+          exit $RC
+
+      # 下面这两套【自己起服务器】（keepalive 要读服务器日志确认处理了哪个请求；
+      # emfile 要先把 ulimit -n 压低再启动），所以必须等上面的服务器都杀掉之后再跑。
+      # 它们启动前会检查 8888 是否空闲 —— 被占用就直接退出码 2，这才是对的：
+      # 宁可报"环境不对"，也不能连到别人的服务器上跑出一片假绿。
+      - name: 跑"自己起服务器"的两套（keepalive 7 项 + emfile 2 项）
+        run: |
+          RC=0
+          echo "-------- tests/keepalive_test.py --------"
+          python3 tests/keepalive_test.py || RC=1
+          echo "-------- tests/emfile_test.py --------"
+          python3 tests/emfile_test.py || RC=1
           exit $RC

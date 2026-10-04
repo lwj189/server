@@ -111,17 +111,26 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 ```
 .
-├── p2.cpp                     ← 手写的服务器（就这一个源文件）
+├── p2.cpp                     ← 阻塞版服务器（CP1 ~ CP5）
+├── epoll.cpp                  ← 事件驱动服务器（CP6a ~ CP6d）
+├── request_line.cpp           ← C++ 靶场：请求行解析
 ├── README.md
 ├── .clang-format              ← 代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
-├── .github/workflows/ci.yml   ← CI：严格编译 + 跑 tests/p2_test.py
+├── .github/workflows/ci.yml   ← CI：严格编译 + 跑 4 套测试（36 项）
 ├── notes/
-│   ├── date.txt               p2 的伪代码骨架 + JMeter 压测报告原文
-│   ├── learning_progress.md   学习进度 / 方法论 / 概念清单
-│   └── pitfalls.md            CP1 → CP4 真实踩过的坑（现象 → 根因 → 解决 → 验证）
+│   ├── HANDOFF.md             给新对话的第一份（我是谁 / 怎么教我 / 现状）
+│   ├── learning_progress.md   进度 / 方法论 15 条 / 概念清单
+│   ├── epoll_notes.md         epoll 专题（三件套 / EAGAIN 四态 / LT vs ET）
+│   ├── pitfalls.md            全部踩坑 CP1~CP6d + 元教训
+│   ├── selfcheck.md           自检 69 题（题 + 答案）
+│   └── perf.md                JMeter 压测数据
 └── tests/
-    ├── p2_test.py             冒烟 + 健壮性测试（CI 用这个）
+    ├── p2_test.py             23 项【协议正确性】对 p2 和 epoll 都跑
+    ├── balance_test.py        4 项【资源配平】fd + 账本
+    ├── keepalive_test.py      7 项【keep-alive】自己起服务器
+    ├── emfile_test.py         2 项【EMFILE 不空转】自己起服务器
+    ├── parse_test.py          10 项【请求行解析靶场】
     ├── load_test.sh           JMeter 压测驱动
     ├── analyze.sh             压测结果分析
     ├── http_load.jmx          JMeter 测试计划
@@ -130,13 +139,17 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 ## 学习笔记索引
 
-- **`notes/pitfalls.md`** —— 最有价值的一份：每一条都是**真撞过的**，包含报错原文、根因、修法、验证方式。例如：
+每份笔记**只有一个职责**，同一件事不会写在两个地方：
+
+- **`notes/HANDOFF.md`** —— 新对话读的第一份：我是谁 / 怎么教我 / 项目现状 / 下一步
+- **`notes/pitfalls.md`** —— **全部踩过的坑**（CP1~CP6d）+ 元教训。每条包含现象、根因、修法、验证方式。例如：
   - `bool reuse` 让 `setsockopt` 返回 `EINVAL`（内核要求 `optlen >= sizeof(int)`）
   - `EADDRINUSE` 的两种成因（TIME_WAIT vs 有活进程），以及为什么 `SO_REUSEADDR` 只救得了前者
-  - 改了源码行为没变（没重新编译 / 没保存）
-  - 重定向到文件后日志是空的（stdout 全缓冲）
-- **`notes/learning_progress.md`** —— 进度、查手册的方法论、已掌握的概念清单
-- **`notes/date.txt`** —— 压测报告原文
+  - `EMFILE`（本进程 fd 用光）vs `ENFILE`（整机用光）—— 填错的表现是"空转照旧"
+- **`notes/learning_progress.md`** —— 进度、方法论、已掌握的概念清单
+- **`notes/epoll_notes.md`** —— epoll 技术专题
+- **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
+- **`notes/perf.md`** —— JMeter 压测数据（⚠ 测的是 `p2` 阻塞版）
 
 ## 说明
 

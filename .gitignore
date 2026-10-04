@@ -10,6 +10,7 @@ p2
 p3
 p4
 epoll
+request_line
 
 # CI / 测试产生的日志
 build.log

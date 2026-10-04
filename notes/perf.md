@@ -1,3 +1,11 @@
+# 压测数据（JMeter）
+
+> 这是本项目**唯一的性能数据**，别埋着。
+> ⚠ 被测版本是 **`p2.cpp`（单线程阻塞 + backlog=3）** —— epoll 版还没测过。
+> 重跑：`tests/load_test.sh`（驱动）→ `tests/analyze.sh`（出统计表）
+
+---
+
 1.源码于p2（做一个简易的socket服务器）
 
 int main() {

@@ -23,12 +23,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"   # 先记住脚本所在目录（te
 cd "$SCRIPT_DIR/.."                            # 再切到 server/，无论从哪里调用
 
 # ---------------- 配置 ----------------
-JMETER="${JMETER:-$HOME/桌面/apache-jmeter-5.6.3/bin/jmeter}"
+JMETER="${JMETER:-$HOME/apache-jmeter-5.6.3/bin/jmeter}"
 PLAN="tests/http_load.jmx"                     # 通用模板
 ANALYZE="$SCRIPT_DIR/analyze.sh"               # 通用分析器
 OUTDIR="tests/results"
-PORT="${PORT:-8888}"                           # 要和 p2.cpp 里的 constexpr PORT 一致
+PORT="${PORT:-8888}"                           # 要和服务器源码里的 constexpr PORT 一致
 RAMPUP=1                                       # 每档的爬坡时间（秒）
+
+# 压谁？（默认 p2 阻塞版）
+#   压 epoll 版：  BIN=./epoll SRC=epoll.cpp TAG=e- ./tests/load_test.sh
+SRC="${SRC:-p2.cpp}"
+BIN="${BIN:-./p2}"
+KEEPALIVE="${KEEPALIVE:-false}"                # 透传给 .jmx 的 -Jkeepalive
+TAG="${TAG:-}"                                 # 结果文件名前缀，避免不同服务器/配置互相覆盖
 
 # 阶梯格式：并发:循环次数
 if [ $# -eq 2 ]; then
@@ -51,8 +58,8 @@ if ss -tln 2>/dev/null | grep -q ":$PORT "; then
 fi
 
 # ---------------- 1. 编译 ----------------
-echo "==> 编译 p2.cpp ..."
-if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 2> "$OUTDIR/build.log"; then
+echo "==> 编译 $SRC ..."
+if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion "$SRC" -o "$BIN" 2> "$OUTDIR/build.log"; then
     echo "✗ 编译失败："
     cat "$OUTDIR/build.log"
     exit 1
@@ -61,8 +68,8 @@ fi
 echo "    ✓ 编译通过（零错误零警告）"
 
 # ---------------- 2. 启动服务器 ----------------
-echo "==> 启动服务器（端口 $PORT）..."
-./p2 > "$OUTDIR/srv.log" 2>&1 &
+echo "==> 启动服务器 $BIN（端口 $PORT，keepalive=$KEEPALIVE）..."
+"$BIN" > "$OUTDIR/srv.log" 2>&1 &
 SRV_PID=$!
 
 cleanup() {
@@ -90,7 +97,7 @@ GENERATED=""                                   # 本轮生成的结果文件（�
 for lv in $LEVELS; do
     THREADS="${lv%%:*}"
     LOOPS="${lv##*:}"
-    LABEL="t${THREADS}x${LOOPS}"
+    LABEL="${TAG}t${THREADS}x${LOOPS}"
     JTL="$OUTDIR/$LABEL.jtl"
     rm -f "$JTL"
     GENERATED="$GENERATED $JTL"                # 先删后记，避免读到旧结果
@@ -100,6 +107,7 @@ for lv in $LEVELS; do
     "$JMETER" -n -j "$OUTDIR/$LABEL.jmeter.log" -t "$PLAN" -l "$JTL" \
               -Jhost=127.0.0.1 -Jport="$PORT" \
               -Jthreads="$THREADS" -Jloops="$LOOPS" -Jrampup="$RAMPUP" \
+              -Jkeepalive="$KEEPALIVE" \
               > /dev/null 2>&1
     echo "完成"
 done

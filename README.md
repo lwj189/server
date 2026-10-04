@@ -96,16 +96,53 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 → 也就是说：单线程阻塞 + `backlog=3` 的服务器，**被压垮的不是 CPU，而是那个只有 3 个位置的等位区**。
 
+#### epoll 版实测数据（2026-10-04）
+
+被测版本：`epoll.cpp`（单线程事件驱动 + CP6d-2 的 keep-alive）。
+**完整数据（A/B 对照、阶梯、工具坑）见 `notes/stress.md` 第 2 节**，这里只留摘要。
+
+```bash
+BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # 关 keep-alive
+BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 keep-alive
+```
+
+| 场景（同机压测，绝对值仅供参考） | 吞吐 | 失败 |
+| --- | --- | --- |
+| epoll，50 并发，`Connection: close` | ~3690 /s | 0 |
+| epoll，50 并发，**keep-alive** | **~10073 /s**（2.7×，连接数 10000 → **50**） | 0 |
+| epoll，100 并发，keep-alive | 11947 /s | 0 |
+| epoll，200 并发，keep-alive | 14875 /s | 3 (0.01%) |
+| epoll，400 并发，keep-alive | 17305 /s | 21 (0.03%) |
+| p2（对比），100 并发 | 4935.8 /s | 2 (0.01%) |
+| p2（对比），200 并发 | 7900.5 /s | 38 (0.10%) |
+
+**结论（这部分比数字重要）**
+
+1. **keep-alive 是最大的那个杠杆**：连接数 10000 → 50，吞吐 2.7×。
+   epoll 的收益**不是**"处理请求更快"（p50 一直零点几毫秒），
+   而是"**一个线程同时握住很多连接**"—— 没有这一点，keep-alive 根本无从谈起。
+2. **`建连 p99` 从 1001 ms 掉到 0 ms** —— p2 那道"连不上"的墙消失了
+   （1001 ms = TCP SYN 重传退避，见上一节）。
+3. **墙的根因一直是 `backlog=3`，不是 CPU**：p2 是被"每请求一条连接"撞出来的；
+   keep-alive 把连接数压掉，墙才退远。剩下的失败（200 / 400 并发那几个）
+   **全部发生在爬坡瞬间** → 下一步该调 `listen(fd, backlog)` 与 `net.core.somaxconn`。
+
+> ⚠ **压测工具自己踩过两个坑**（都已在本次修复，详见 `notes/stress.md`）：
+> ① `analyze.sh` 会把 JMeter 多行 `failureMessage` 的续行当成样本
+> → 吞吐列直接变 **0**；② `http_load.jmx` 的 `use_keepalive` 写成 `boolProp` 时
+> `-Jkeepalive=true` **静默失效** → 连跑两轮其实测的是同一个配置。
+
 ## 已知限制（都还没修，正是后面的学习内容）
 
-| # | 限制 | 后果 | 计划 |
+| # | 限制 | 后果 | 状态 |
 | --- | --- | --- | --- |
-| 1 | **一次 `read` ≠ 一个完整请求** | 客户端分片发送时，服务器会基于不完整的请求就响应 | CP5：按连接维护读缓冲区 |
-| 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | 非阻塞 + `epoll` |
-| 3 | `backlog = 3` | 100~200 并发下开始丢连接（见上面的压测） | 调大 / 引入多 Reactor |
-| 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | 支持 `Connection: keep-alive` |
-| 5 | `send` 未处理部分写 | 响应很大时可能发不完整 | 循环发送 / 输出缓冲区 |
-| 6 | 没有日志系统、没有优雅退出 | 只用 `std::cout`；`Ctrl+C` 直接终止 | 后续 |
+| 1 | **一次 `read` ≠ 一个完整请求** | 客户端分片发送时，服务器会基于不完整的请求就响应 | ✅ CP5 已修（`inbuf` + 定界） |
+| 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
+| 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 keep-alive 之后**只剩这一处**，见上面压测结论 ③ |
+| 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`epoll.cpp`；2.7× 吞吐） |
+| 5 | `send` 未处理部分写 | 响应很大时可能发不完整 | ⬜ CP6d-3 故意留着（当前响应 117 字节，**撞不到**，写不出会红的测试） |
+| 6 | 没有日志系统、没有优雅退出 | 只用 `std::cout`；`Ctrl+C` 直接终止 | ⬜ 后续 |
+| 7 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 未验证的猜想：它可能正在压着吞吐上限。要验证就造一个"关掉日志"的变体对比 |
 
 ## 目录结构
 
@@ -124,7 +161,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 │   ├── epoll_notes.md         epoll 专题（三件套 / EAGAIN 四态 / LT vs ET）
 │   ├── pitfalls.md            全部踩坑 CP1~CP6d + 元教训
 │   ├── selfcheck.md           自检 69 题（题 + 答案）
-│   └── perf.md                JMeter 压测数据
+│   └── stress.md              JMeter 压测数据（p2 + epoll 两批）
 └── tests/
     ├── p2_test.py             23 项【协议正确性】对 p2 和 epoll 都跑
     ├── balance_test.py        4 项【资源配平】fd + 账本
@@ -149,7 +186,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 - **`notes/learning_progress.md`** —— 进度、方法论、已掌握的概念清单
 - **`notes/epoll_notes.md`** —— epoll 技术专题
 - **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
-- **`notes/perf.md`** —— JMeter 压测数据（⚠ 测的是 `p2` 阻塞版）
+- **`notes/stress.md`** —— JMeter 压测数据：第 1 节 `p2`（阻塞版）、第 2 节 `epoll`（keep-alive），含压测工具自身的两个坑
 
 ## 说明
 

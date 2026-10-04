@@ -69,8 +69,16 @@ printf '%0.s-' $(seq 1 "$TOTAL"); echo
 
 for f in "${valid[@]}"; do
     # 一趟 awk：样本数 / 失败数 / 平均 / 耗时 / 吞吐
+    #
+    # ⚠ $1 ~ /^[0-9]+$/ 这个守卫不能删：
+    #   JMeter 的 failureMessage 字段可能【带换行】（失败详情里的 "****** received :"），
+    #   那些续行会被当成新样本 —— 它们的 $1 不是数字，算进来会同时毁掉三样东西：
+    #     · 样本数虚高（实测 10019 ≠ 10000）
+    #     · $1 + 0 = 0 把 min 拉到 0 → 耗时算成 1.79e9 秒（56 年）
+    #     · 吞吐 = 样本数 / 耗时 → 直接归零（最坑：看起来像"服务器崩了"）
+    #   真正的样本行第一列是毫秒时间戳，一定是纯数字。
     read -r n err avg dur tput < <(awk -F, '
-        NR > 1 {
+        NR > 1 && $1 ~ /^[0-9]+$/ {
             n++; sum += $2;
             if ($8 == "false") err++;
             ts = $1 + 0; te = ts + $2;
@@ -83,7 +91,7 @@ for f in "${valid[@]}"; do
         }' "$f")
 
     # 总耗时分位数（第 2 列 elapsed）
-    read -r p50 p90 p99 pmax < <(awk -F, 'NR>1{print $2}' "$f" | sort -n | awk '
+    read -r p50 p90 p99 pmax < <(awk -F, 'NR>1 && $1 ~ /^[0-9]+$/ {print $2}' "$f" | sort -n | awk '
         { a[NR] = $1 }
         END {
             if (NR == 0) { print "0 0 0 0"; exit }
@@ -91,7 +99,7 @@ for f in "${valid[@]}"; do
         }')
 
     # 建连 p99（最后一列 Connect：用来区分"建连慢"还是"处理慢"）
-    cp99=$(awk -F, 'NR>1{print $NF}' "$f" | sort -n | awk '{ a[NR] = $1 } END { print (NR ? a[int(NR*0.99)] : 0) }')
+    cp99=$(awk -F, 'NR>1 && $1 ~ /^[0-9]+$/ {print $NF}' "$f" | sort -n | awk '{ a[NR] = $1 } END { print (NR ? a[int(NR*0.99)] : 0) }')
 
     rate=$(awk -v e="$err" -v n="$n" 'BEGIN { printf "%.2f%%", (n ? e*100/n : 0) }')
 
@@ -118,8 +126,8 @@ if [ ${#valid[@]} -ge 2 ]; then
 
     rates=(); maxr=0
     for f in "${valid[@]}"; do
-        n=$(awk -F, 'NR>1' "$f" | wc -l)
-        e=$(awk -F, 'NR>1 && $8=="false"' "$f" | wc -l)
+        n=$(awk -F, 'NR>1 && $1 ~ /^[0-9]+$/' "$f" | wc -l)
+        e=$(awk -F, 'NR>1 && $1 ~ /^[0-9]+$/ && $8=="false"' "$f" | wc -l)
         r=$(awk -v e="$e" -v n="$n" 'BEGIN { printf "%.4f", (n ? e*100/n : 0) }')
         rates+=("$r")
         maxr=$(awk -v a="$maxr" -v b="$r" 'BEGIN { print (b > a ? b : a) }')

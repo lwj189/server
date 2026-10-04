@@ -7,7 +7,14 @@
 -Jthreads=100  -Jloops=200  -Jrampup=1  -Jkeepalive=false
 -Jconnect_timeout=2000  -Jresponse_timeout=5000
 例：jmeter -n -t http_load.jmx -l out.jtl -Jthreads=100 -Jloops=200
-附断言：响应码不是 200 就算失败。</stringProp>
+附断言：响应码不是 200 就算失败。
+
+⚠ use_keepalive 必须是 stringProp，不能写成 boolProp：
+  JMeter【不会】对 boolProp 里的 ${__P(...)} 求值 —— 写 boolProp 时
+  -Jkeepalive=true 会【静默失效】（照旧发 Connection: close）。
+  实测：boolProp + -Jkeepalive=true → 2000 请求开 2000 条连接；
+        stringProp + -Jkeepalive=true → 2000 请求只开 10 条连接。
+  验证方法：看服务器收到的请求头里是 keep-alive 还是 close。</stringProp>
       <boolProp name="TestPlan.functional_mode">false</boolProp>
       <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
       <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
@@ -43,7 +50,7 @@
           <stringProp name="HTTPSampler.method">${__P(method,GET)}</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
-          <boolProp name="HTTPSampler.use_keepalive">${__P(keepalive,false)}</boolProp>
+          <stringProp name="HTTPSampler.use_keepalive">${__P(keepalive,false)}</stringProp>
           <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
           <stringProp name="HTTPSampler.connect_timeout">${__P(connect_timeout,2000)}</stringProp>

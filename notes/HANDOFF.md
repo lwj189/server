@@ -99,6 +99,7 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 ~/桌面/server/
 ├── p2.cpp              ← 我手写的服务器（阻塞版），CP1~CP5，23 项测试全过
 ├── epoll.cpp           ← 事件驱动的 HTTP 服务器（约 515 行）：CP6a~CP6c + CP6d-1/-2
+├── request_line.cpp    ← C++ 靶场：请求行解析（练习用，还没接进服务器）
 ├── README.md
 ├── .clang-format       ← 代码风格（4 空格缩进 / Attach 括号 / 指针贴左 / 不折行）
 ├── .github/workflows/ci.yml ← CI：严格编译 p2+epoll（有警告即失败），再跑 4 套测试
@@ -109,7 +110,7 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 │   ├── epoll_notes.md      ← epoll 专题：API + 概念 + 坑 + 速查表（CP6a ~ CP6d）
 │   ├── pitfalls.md         ← 【全部踩坑】CP1~CP6d + 元教训（心得）。坑只有这一个家
 │   ├── selfcheck.md        ← 自检 69 题【题 + 答案】（先自己答，再往下翻）
-│   └── perf.md             ← JMeter 压测数据 + 拐点分析（⚠ 测的是 p2 阻塞版）
+│   └── stress.md           ← JMeter 压测数据：p2（阻塞版）+ epoll（keep-alive）两批 + 工具坑
 └── tests/
     ├── p2_test.py         ← 【正确性】23 项：正常/连上就关/RST/并发/半包/超长头/body 分片…
     ├── balance_test.py    ← 【配平】4 项：fd + 账本两本账（原 cp6b_test.py，见文件头注释）

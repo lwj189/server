@@ -144,32 +144,44 @@ BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 ke
 
 ```
 .
-├── p2.cpp                     ← 阻塞版服务器（CP1 ~ CP5）
-├── epoll.cpp                  ← 事件驱动服务器（CP6a ~ CP6d）
-├── request_line.cpp           ← C++ 靶场：请求行解析
+├── p2.cpp                     ← 阻塞版服务器（CP1 ~ CP5）：一次只能服务一条连接
+├── epoll.cpp                  ← 单线程 Reactor 版（CP6a ~ CP6d）：一个线程 + 一个 epoll
+├── thread.cpp                 ← 单 Reactor + 线程池版：主线程管 IO，工人算业务
+├── http.hpp                   ← 上面三个服务器【共用】的 HTTP 逻辑
+│                                （ClientContext / 解析 / 拼响应 / 线程安全日志）
+├── thread_pool.hpp            ← 线程池类（只有一份，两个文件 include 它）
+├── thread_pool.cpp            ← 线程池独立演示（不接服务器，10 个假任务看怎么分）
 ├── README.md
 ├── .clang-format              ← 代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
 ├── .github/workflows/ci.yml   ← CI：严格编译 + 跑 4 套测试（36 项）
 ├── notes/
-│   ├── HANDOFF.md             给新对话的第一份（我是谁 / 怎么教我 / 现状）
+│   ├── HANDOFF.md             项目笔记：现状 / 踩坑 / 下一步（自己回来先读这份）
 │   ├── learning_progress.md   进度 / 方法论 15 条 / 概念清单
 │   ├── epoll_notes.md         epoll 专题（三件套 / EAGAIN 四态 / LT vs ET）
 │   ├── pitfalls.md            全部踩坑 CP1~CP6d + 元教训
 │   ├── selfcheck.md           自检 69 题（题 + 答案）
-│   ├── stress.md              压测【数字】（p2 + epoll 两批）
+│   ├── stress.md              压测【数字】（p2 + epoll + thread 三批）
 │   └── loadtest_guide.md      压测【方法】（测什么 / 怎么看 / 观察什么）
 └── tests/
-    ├── p2_test.py             23 项【协议正确性】对 p2 和 epoll 都跑
-    ├── balance_test.py        4 项【资源配平】fd + 账本
+    ├── p2_test.py             23 项【协议正确性】三个服务器都跑
+    ├── balance_test.py        4 项【资源配平】fd + 账本（要 --pid 和 --log）
     ├── keepalive_test.py      7 项【keep-alive】自己起服务器
     ├── emfile_test.py         2 项【EMFILE 不空转】自己起服务器
-    ├── parse_test.py          10 项【请求行解析靶场】
-    ├── load_test.sh           JMeter 压测驱动
+    ├── load_test.sh           JMeter 压测驱动（压线程池版：BIN=./thread SRC=thread.cpp）
     ├── analyze.sh             压测结果分析
     ├── http_load.jmx          JMeter 测试计划
     └── results/               压测产物（已 gitignore）
 ```
+
+**三个服务器怎么选**：
+
+| 想干什么 | 用哪个 |
+| --- | --- |
+| 看最朴素的阻塞写法（对照用） | `./p2` |
+| 看事件驱动、跑协议/配平测试 | `./epoll` |
+| 看线程池怎么和 epoll 配合 | `./thread --workers 4` |
+| 单独把线程池跑起来看 | `./thread_pool` |
 
 ## 学习笔记索引
 

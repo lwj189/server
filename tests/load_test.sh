@@ -32,8 +32,12 @@ RAMPUP=1                                       # 每档的爬坡时间（秒）
 
 # 压谁？（默认 p2 阻塞版）
 #   压 epoll 版：  BIN=./epoll SRC=epoll.cpp TAG=e- ./tests/load_test.sh
+#   压多线程版：   BIN=./thread SRC=thread.cpp TAG=t- ./tests/load_test.sh
 SRC="${SRC:-p2.cpp}"
 BIN="${BIN:-./p2}"
+# -pthread 对 p2 / epoll 是无害的（没有线程就是空开关），
+# 但 thread.cpp 不加会链接失败 —— 所以统一带上，省得压多线程版时才发现。
+CXXFLAGS="${CXXFLAGS:--std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -pthread}"
 KEEPALIVE="${KEEPALIVE:-false}"                # 透传给 .jmx 的 -Jkeepalive
 TAG="${TAG:-}"                                 # 结果文件名前缀，避免不同服务器/配置互相覆盖
 
@@ -59,7 +63,7 @@ fi
 
 # ---------------- 1. 编译 ----------------
 echo "==> 编译 $SRC ..."
-if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion "$SRC" -o "$BIN" 2> "$OUTDIR/build.log"; then
+if ! g++ $CXXFLAGS "$SRC" -o "$BIN" 2> "$OUTDIR/build.log"; then
     echo "✗ 编译失败："
     cat "$OUTDIR/build.log"
     exit 1

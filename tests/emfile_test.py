@@ -128,7 +128,7 @@ def http_get_ok(timeout=3.0):
 
 def main():
     ap = argparse.ArgumentParser(description='CP6d 验收：EMFILE 忙等')
-    ap.add_argument('--bin', default='./epoll', help='服务器可执行文件')
+    ap.add_argument('--bin', default='build/epoll', help='服务器可执行文件')
     ap.add_argument('--limit', type=int, default=64, help='服务器的 ulimit -n')
     ap.add_argument('--log', default='/tmp/emfile_test_server.log')
     args = ap.parse_args()

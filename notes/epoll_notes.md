@@ -10,7 +10,7 @@
 
 **阻塞式的代价**：等待会霸占整个线程。
 
-CP3 时的实测（阻塞版 `p2.cpp`）：
+CP3 时的实测（阻塞版 `src/p2.cpp`）：
 
 ```
 客户端1 连上但不发数据
@@ -18,7 +18,7 @@ CP3 时的实测（阻塞版 `p2.cpp`）：
   → 此时客户端2 请求：1047ms 后超时（curl 退出码 28）
 ```
 
-**epoll 版的实测**（`epoll.cpp`，CP6a）：
+**epoll 版的实测**（`src/epoll.cpp`，CP6a）：
 
 ```
 $ ps -o pid,stat,pcpu,wchan:18,cmd -p <pid>
@@ -239,7 +239,7 @@ while (true) {
 | **CP6a** | 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN` | ✅ 完成（`e468ac9`） |
 | **CP6b** | 把 **client fd 纳入 epoll**（设非阻塞 + `EPOLL_CTL_ADD`），事件循环里区分 `server_fd` / client fd | ✅ 完成（`a9e7494`） |
 | **CP6c-1** | 引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**） | ✅ 完成（`5392991`） |
-| **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应（`inbuf` + `tryHandleRequest`） | ✅ 完成（验收：`p2_test.py` 23/23 对着 `./epoll`） |
+| **CP6c-2** | 把 CP5 的**状态机搬进来**，回真正的 HTTP 响应（`inbuf` + `tryHandleRequest`） | ✅ 完成（验收：`p2_test.py` 23/23 对着 `build/epoll`） |
 | **CP6d-1** | 加固①：`EMFILE` 忙等 —— 撞 fd 上限后**暂停接收**而不是空转 | ✅ 完成（验收：`emfile_test.py` 2/2） |
 | **CP6d-2** | 加固②：**keep-alive** —— 一条连接服务多个请求 | ✅ 完成（验收：`keepalive_test.py` 7/7） |
 | **CP6d-3** | 加固③：**部分写**（`send` 返回 < n → 输出缓冲 + `EPOLLOUT`） | ⬜ 下一步（现在撞不到，见下） |
@@ -365,9 +365,9 @@ HTTP/1.1 **默认是复用**，所以"没写这个头"= 继续保持。
 CP6c-2 把 `inbuf` 真正用起来了。**
 **这就是"状态机切片"**：把一个连续执行的函数，改造成"每次事件恢复一点进度"。
 
-**CP6c-2 的切片点**（和 `p2.cpp` 对照着看最清楚）：
+**CP6c-2 的切片点**（和 `src/p2.cpp` 对照着看最清楚）：
 
-| | `p2.cpp`（阻塞版） | `epoll.cpp`（事件驱动） |
+| | `src/p2.cpp`（阻塞版） | `src/epoll.cpp`（事件驱动） |
 | --- | --- | --- |
 | 收到一部分 | `while (!header_done) { read... }` **堵着等** | `ctx.inbuf.append(...)` 攒起来 |
 | 还不够一个请求 | 循环继续 | **`return false`**，函数退出，进度留在 `inbuf` |

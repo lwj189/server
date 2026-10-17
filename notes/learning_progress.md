@@ -19,8 +19,8 @@ day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP
    → **C++ 靶场：请求行解析 ⬅ 已移出仓库**（需要时从分支对话恢复）
 ```
 
-练习文件：`p2.cpp`（自己手写，**阻塞版**，CP1~CP5）
-　　　　　`epoll.cpp`（**day4 练习**，事件驱动 HTTP 服务器，511 行）
+练习文件：`src/p2.cpp`（自己手写，**阻塞版**，CP1~CP5）
+　　　　　`src/epoll.cpp`（**day4 练习**，事件驱动 HTTP 服务器，511 行）
 自动化验收 —— **4 套脚本 / 共 36 项检查，当前全绿**：
 
 | 脚本 | 测什么 | 结果 |
@@ -30,9 +30,9 @@ day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP
 | `tests/keepalive_test.py` | 【协议】keep-alive / 粘包 / `close` 回归 | 7/7 |
 | `tests/emfile_test.py` | 【健壮性】fd 撞上限后不许空转 | 2/2 |
 
-一句话现状：**`epoll.cpp` 已经是一个事件驱动的 HTTP 服务器** —— 单线程同时持有多条连接、
+一句话现状：**`src/epoll.cpp` 已经是一个事件驱动的 HTTP 服务器** —— 单线程同时持有多条连接、
 能正确分帧、能复用连接（keep-alive）、fd 撞上限会暂停接收而不是空转。
-`p2.cpp` 保留为**阻塞版对照组**（同样的 HTTP 逻辑，一次只服务一条连接）。
+`src/p2.cpp` 保留为**阻塞版对照组**（同样的 HTTP 逻辑，一次只服务一条连接）。
 
 ---
 
@@ -202,7 +202,7 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/
 所以 t11/t12 必须"**先只发一半 body、停 1 秒、看服务器有没有抢跑**" ——
 只看"最终返回 200"是抓不住 bug 的，因为**正确和错误两种行为都会返回 200**。
 
-### ✅ CP6a：epoll 事件循环（`epoll.cpp`）
+### ✅ CP6a：epoll 事件循环（`src/epoll.cpp`）
 
 **目标**：把"阻塞单连接"改成"**1 个线程照看 N 个连接**"。先只搭事件循环，**不接 HTTP 解析**。
 
@@ -290,10 +290,10 @@ HANDOFF §7 原来的验收是"3 个 nc 都不关、该打印 fd 5/6/7"。
 
 - 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
 - 做法：`ClientContext` 加 `std::string inbuf`；三段纯函数（`toLowerAscii`/`findHeader`/
-  `isAllDigits`）从 `p2.cpp` **原样搬**（纯函数搬家不要钱，代码逐字节相同）；
+  `isAllDigits`）从 `src/p2.cpp` **原样搬**（纯函数搬家不要钱，代码逐字节相同）；
   新增 `tryHandleRequest(ctx)` —— p2 那边是 `while` 堵着读到收全，这边是**不够就 return，等下次**
 - 5 个空：`"\r\n\r\n"` / `std::string::npos` / `true`（头超限判死刑）/ `header_end + 4 + content_len` / `false`
-- 验收：`tests/p2_test.py` 的 **23 项**对着 `./epoll` **全部通过**（搬迁前实测 **0/23**）
+- 验收：`tests/p2_test.py` 的 **23 项**对着 `build/epoll` **全部通过**（搬迁前实测 **0/23**）
 - ⚠ 踩到的：`total` 只写 `header_end + 4`（漏了 `+ content_len`）→ 编译器警告
   `content_len set but not used`，测试 **17/23**、6 个失败全是"**提前响应**"
 - 副产物：`tests/balance_test.py`（原 `cp6b_test.py`）—— 见 `pitfalls.md` 的「元教训」节
@@ -422,11 +422,11 @@ note: there are 5 candidates
 ### 7. 改源码 → 保存 → 重新编译
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp -o build/p2 && build/p2
 ```
 
 `&&` = 编译成功才运行，永远不会忘编译。
-怀疑"改了没生效"时先比时间戳：`ls -l --time-style=+%H:%M:%S p2.cpp p2`
+怀疑"改了没生效"时先比时间戳：`ls -l --time-style=+%H:%M:%S src/p2.cpp p2`
 
 ### 8. 手册给你零件，组装靠模型
 

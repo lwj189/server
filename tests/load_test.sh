@@ -31,10 +31,10 @@ PORT="${PORT:-8888}"                           # 要和服务器源码里的 con
 RAMPUP=1                                       # 每档的爬坡时间（秒）
 
 # 压谁？（默认 p2 阻塞版）
-#   压 epoll 版：  BIN=./epoll SRC=epoll.cpp TAG=e- ./tests/load_test.sh
-#   压多线程版：   BIN=./thread SRC=thread.cpp TAG=t- ./tests/load_test.sh
-SRC="${SRC:-p2.cpp}"
-BIN="${BIN:-./p2}"
+#   压 epoll 版：  BIN=build/epoll SRC=src/epoll.cpp TAG=e- ./tests/load_test.sh
+#   压多线程版：   BIN=build/thread SRC=src/thread.cpp TAG=t- ./tests/load_test.sh
+SRC="${SRC:-src/p2.cpp}"
+BIN="${BIN:-build/p2}"
 # -pthread 对 p2 / epoll 是无害的（没有线程就是空开关），
 # 但 thread.cpp 不加会链接失败 —— 所以统一带上，省得压多线程版时才发现。
 CXXFLAGS="${CXXFLAGS:--std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -pthread}"
@@ -52,7 +52,7 @@ fi
 [ -x "$JMETER" ]  || { echo "✗ 找不到 JMeter：$JMETER"; exit 1; }
 [ -f "$PLAN" ]    || { echo "✗ 找不到测试计划：$PLAN"; exit 1; }
 [ -x "$ANALYZE" ] || { echo "✗ 找不到分析脚本：$ANALYZE"; exit 1; }
-mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR" build
 
 if ss -tln 2>/dev/null | grep -q ":$PORT "; then
     echo "✗ 端口 $PORT 已被占用："

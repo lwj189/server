@@ -208,7 +208,7 @@ def t3_connection_close_still_closes(r, logpath):
 # ----------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description='CP6d 验收：keep-alive')
-    ap.add_argument('--bin', default='./epoll', help='服务器可执行文件')
+    ap.add_argument('--bin', default='build/epoll', help='服务器可执行文件')
     ap.add_argument('--log', default='/tmp/keepalive_test_server.log')
     args = ap.parse_args()
 

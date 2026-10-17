@@ -1,25 +1,30 @@
 # Windows 系统自动生成
 desktop.ini
 
-# 编译产物
-thread
-thread_pool
-lib_server
-*.o
-*.out
-*.exe
-a.out
+# ---- 构建产物：统一放 build/，清理就一条 rm -rf build/ ----
+build/
+
+# 万一有人直接在根目录编译了，也挡住（可执行文件和源码同名，只能逐个列）
 p2
 p3
 p4
 epoll
+thread
+thread_pool
+lib_server
 
-# CI / 测试产生的日志
+# 编译中间文件
+*.o
+*.out
+*.exe
+a.out
+
+# ---- 运行产物 ----
 build.log
 server.log
-
-# 压测产物（jtl 结果 + 服务器日志，文件很大）
-tests/results/
-
-# JMeter 自己的日志（加了 -j 后不会落在这里，兜底）
+srv.log
+recvq.log
 jmeter.log
+
+# 压测产物（.jtl 每个几百 KB ~ 几 MB，跑几次就上百 MB）
+tests/results/

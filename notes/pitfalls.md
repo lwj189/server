@@ -1,6 +1,6 @@
 # 踩坑记录（CP1 → CP6d）
 
-> 这份文档记录的是**我在手写 `p2.cpp` 时真实撞过的坑**，不是"常见错误大全"。
+> 这份文档记录的是**我在手写 `src/p2.cpp` 时真实撞过的坑**，不是"常见错误大全"。
 > 每条都包含：**现象（报错原文）→ 根因 → 解决 → 怎么验证**。
 > 遇到问题先在下面的"症状速查"里找编号，再跳过去看根因。
 >
@@ -26,11 +26,11 @@
 | 改了源码，运行行为没变 | C1 |
 | VSCode 里编辑了，但文件内容没变 | C2 |
 | `xxx.cpp: 没有那个文件或目录` | C3 |
-| `./p2 > log.txt` 之后日志是空的 | C4 |
+| `build/p2 > log.txt` 之后日志是空的 | C4 |
 | 代码里 `using namespace std;` 和 `std::` 混用 | C5 |
 | `bind: Address already in use` | D1 |
 | 退出后端口还被占着 | D2 |
-| `./p2` 跑起来"什么都没有" | D3 |
+| `build/p2` 跑起来"什么都没有" | D3 |
 | 客户端分两段发，服务器只收到前半段 | D4 |
 | 一个不发数据的客户端让整个服务器卡住 | D5 |
 | `send: Connection reset by peer` / `Broken pipe` | D6 |
@@ -374,25 +374,25 @@ close(conn_fd);      // close 留在外面：所有分支都要关连接
 
 ### C1 改了源码，运行行为没变（**没重新编译**）
 
-**现象**：明明改了 `p2.cpp`，`./p2` 跑出来还是老样子（甚至"什么都没有"）。
+**现象**：明明改了 `src/p2.cpp`，`build/p2` 跑出来还是老样子（甚至"什么都没有"）。
 
-**根因**：C++ 是**编译型**语言。`p2.cpp` 是图纸，`p2` 是上次造好的机器——**改图纸不重新造，机器不会变**。
+**根因**：C++ 是**编译型**语言。`src/p2.cpp` 是图纸，`p2` 是上次造好的机器——**改图纸不重新造，机器不会变**。
 
 时间戳实锤：
 
 ```
 p2       16:07:48   ← 二进制
-p2.cpp   16:09:07   ← 源码（比二进制晚 1 分 19 秒）→ 没重新编译
+src/p2.cpp   16:09:07   ← 源码（比二进制晚 1 分 19 秒）→ 没重新编译
 ```
 
 **解决**
 
 ```bash
 # 编译 + 运行串成一条命令：&& = 前面成功才执行后面
-g++ -std=c++17 -Wall -Wextra p2.cpp -o p2 && ./p2
+g++ -std=c++17 -Wall -Wextra src/p2.cpp -o build/p2 && build/p2
 
 # 怀疑"改了没生效"时，第一件事比时间戳
-ls -l --time-style=+%H:%M:%S p2.cpp p2
+ls -l --time-style=+%H:%M:%S src/p2.cpp p2
 ```
 
 **教训**：专业项目用 `make` / `CMake` / `ninja`，它们干的核心事情之一就是**比较源码和产物的时间戳**，决定要不要重新编译。手动敲 `g++` 烦了的时候，就是该学 `Makefile` 的时候。
@@ -409,7 +409,7 @@ ls -l --time-style=+%H:%M:%S p2.cpp p2
 
 ```bash
 # 看源码修改时间有没有变
-ls -l --time-style=+%H:%M:%S p2.cpp
+ls -l --time-style=+%H:%M:%S src/p2.cpp
 ```
 
 改完立刻 `Ctrl+S`，再编译。
@@ -427,10 +427,10 @@ cc1plus: fatal error: cp1.cpp: 没有那个文件或目录
 
 **根因**（两个都中了）
 
-1. **文件名不对**：文件实际叫 `p2.cpp`，我编译的是 `cp1.cpp`
+1. **文件名不对**：文件实际叫 `src/p2.cpp`，我编译的是 `cp1.cpp`
 2. **工作目录不对**：终端在 `~`（家目录 `/home/aaa`），文件在 `~/桌面/server/`
 
-`g++ p2.cpp` 是**在当前工作目录里找文件**，不是全盘搜索。
+`g++ src/p2.cpp` 是**在当前工作目录里找文件**，不是全盘搜索。
 
 **解决：三下自检**
 
@@ -446,14 +446,14 @@ cc1plus: fatal error: cp1.cpp: 没有那个文件或目录
 
 | 写法 | 含义 |
 | --- | --- |
-| `p2.cpp` | 相对路径：从当前工作目录找 |
-| `./p2.cpp` | 同上，`.` 显式表示当前目录 |
+| `src/p2.cpp` | 相对路径：从当前工作目录找 |
+| `build/p2.cpp` | 同上，`.` 显式表示当前目录 |
 | `../day2.cpp` | `..` = 上一级目录 |
 | `~/桌面/server/p2.cpp` | `~` = 家目录，绝对路径，任何目录下都能用 |
 
 ---
 
-### C4 `./p2 > log.txt` 之后日志是空的
+### C4 `build/p2 > log.txt` 之后日志是空的
 
 **现象**：程序在跑，但日志文件里什么都没有；连 `kill` 之后看还是空的。
 
@@ -474,7 +474,7 @@ fflush(stdout);                    // 手动刷新（C 风格）
 fprintf(stderr, "...");            // stderr 本身无缓冲
 ```
 ```bash
-stdbuf -o0 ./p2 > log.txt          // 命令行强制不缓冲
+stdbuf -o0 build/p2 > log.txt          // 命令行强制不缓冲
 ```
 
 **教训**：以后 day4/day5 把日志重定向到文件排查问题时，"日志是空的"会让你怀疑人生——先想想缓冲。
@@ -562,7 +562,7 @@ ss -tlnp | grep 8888        # 确认端口干净（应该没有输出）
 
 ---
 
-### D3 `./p2` 跑起来"什么都没有"
+### D3 `build/p2` 跑起来"什么都没有"
 
 **根因**：**这通常不是 bug**。服务器程序会**一直运行、一直占着终端**，所以光标停在那里不动正是它在工作。
 
@@ -575,7 +575,7 @@ ss -tlnp | grep 8888        # 确认端口干净（应该没有输出）
 
 ```bash
 # 终端1
-./p2
+build/p2
 
 # 终端2（新开一个）
 ss -tlnp | grep 8888        # 看监听状态
@@ -820,13 +820,13 @@ man 2 socket | sed -n '/^RETURN VALUE/,/^ERRORS/p'    # 抽取法：只要某一
 man 2 listen | grep -n -A5 'backlog argument'         # 抓关键段落
 
 # ---- 编译（零错误零警告再继续）----
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp -o build/p2 && build/p2
 
 # ---- 运行期验证 ----
 ss -tlnp | grep 8888              # 监听状态 / Recv-Q / Send-Q / fd
 ss -tan  | grep 8888              # 所有连接状态
 ps -o pid,stat,wchan:20,cmd -p $(pgrep p2)     # 卡在哪个系统调用
-strace -e trace=socket,setsockopt,bind,listen,accept ./p2   # 系统调用序列
+strace -e trace=socket,setsockopt,bind,listen,accept build/p2   # 系统调用序列
 nc 127.0.0.1 8888                 # 手动连一下
 curl -v http://127.0.0.1:8888/    # 看原始往返（含空行）
 curl -sI --http1.1 https://example.com          # 看真实生产服务器的响应头
@@ -838,7 +838,7 @@ kill -9 <pid>                     # 后兵（SIGKILL）
 pkill -x p2                       # 按程序名杀
 
 # ---- 排查"改了没生效" ----
-ls -l --time-style=+%H:%M:%S p2.cpp p2
+ls -l --time-style=+%H:%M:%S src/p2.cpp p2
 ```
 
 ## 附录二：SIGPIPE 专题

@@ -3,7 +3,7 @@
 一个学习用的极简 HTTP 服务器：纯 C++17，不依赖任何框架，只用 Linux 系统调用和 C++ 标准库。
 目的不是"造轮子"，而是把 `socket → bind → listen → accept → read → send → close` 这条链路**亲手写通、写对、压过**。
 
-> 我是正在学服务器方向的学生。这个仓库记录我手写 `p2.cpp` 的全过程：
+> 我是正在学服务器方向的学生。这个仓库记录我手写 `src/p2.cpp` 的全过程：
 > 每一步为什么这么写、踩过哪些坑、以及实测数据。
 
 ---
@@ -11,19 +11,43 @@
 ## 当前状态
 
 ```
-CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅ → CP5 半包处理 ⬜
+CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
+→ CP5 半包/粘包 ✅ → CP6a~d epoll / EMFILE / keep-alive ✅ → 线程池 ✅
 ```
 
-**已经是一个能用的服务器**：`curl` 和浏览器都能访问，返回一个固定的 HTML 页面。
+`src/` 下是五种实现，跑同一套测试：
+
+| 文件 | 并发模型 | 真实代码行 |
+| --- | --- | --- |
+| `src/p2.cpp` | 阻塞串行（一次一条连接） | 172 |
+| `src/epoll.cpp` | 单线程 Reactor | 194 |
+| `src/thread.cpp` | 单 Reactor + 线程池 | 317 |
+| `src/lib_server.cpp` | cpp-httplib（库，每连接一线程） | 40 |
+| `src/thread_pool.cpp` | 线程池独立演示（不接服务器） | — |
 
 ## 编译与运行
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2 && ./p2
-# 输出：listening on port 8888 ...
+mkdir -p build        # 产物统一输出到 build/（已 gitignore；清理就是 rm -rf build）
+
+# 三个手写版（严格编译：有警告就说明代码不干净）
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp     -o build/p2
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp  -o build/epoll
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp -o build/thread -pthread
+
+# 线程池独立演示（不接服务器，单看池子怎么派活）
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_pool.cpp -o build/thread_pool -pthread
+
+# 库版（-I 指向第三方头文件；第一次编译约 8 秒，模板实例化）
+g++ -std=c++17 -O2 src/lib_server.cpp -o build/lib_server -pthread -I third_party/cpp-httplib
+
+# 起一个（⚠ 都占 8888，同时只能跑一个）
+./build/epoll                                  # 或 ./build/p2
+./build/thread --workers 4                     # 线程池版
+./build/lib_server                             # cpp-httplib 版（支持 --port N）
 ```
 
-监听端口在 `p2.cpp` 顶部的 `constexpr uint16_t PORT` 定义。运行后它一直阻塞等待连接，`Ctrl+C` 退出。
+端口：手写版在各自源码顶部的 `constexpr uint16_t PORT`；库版用 `--port N`。
 
 另一个终端里访问：
 
@@ -39,7 +63,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/   # 只打印状
 
 ```bash
 # 终端1：启动服务器
-./p2
+build/p2
 
 # 终端2：
 python3 tests/p2_test.py                 # 默认 127.0.0.1:8888
@@ -71,7 +95,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 #### 实测数据
 
-被测版本：`p2.cpp`（单线程阻塞 + `backlog=3`）
+被测版本：`src/p2.cpp`（单线程阻塞 + `backlog=3`）
 环境：4 核 VM / Ubuntu；`somaxconn=4096`，`ulimit -n=524288`
 工具：JMeter 5.6.3（**同机压测，绝对值仅供参考**）
 场景：`GET /` + `Connection: close`（每个请求新建连接）
@@ -103,15 +127,15 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 #### epoll 版实测数据（2026-10-04）
 
-被测版本：`epoll.cpp`（单线程事件驱动 + CP6d-2 的 keep-alive）。
+被测版本：`src/epoll.cpp`（单线程事件驱动 + CP6d-2 的 keep-alive）。
 
 > 📌 **完整数据在 `notes/stress.md` 第 2 节**：逐档对照表 / 收尾观测（连接数 **761**、
 > `TIME_WAIT` **0**）/ 六条结论 / 压测工具自身的三个坑。
 > **这里只留头条** —— 同一张表不写两处，改一处忘另一处早晚不一致。
 
 ```bash
-BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # 关 keep-alive
-BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 keep-alive
+BIN=build/epoll SRC=src/epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # 关 keep-alive
+BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 keep-alive
 ```
 
 | 同机压测，同一把尺子（`analyze.sh`） | 50 并发 | 100 并发 |
@@ -135,7 +159,7 @@ BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 ke
 | 1 | **一次 `read` ≠ 一个完整请求** | 客户端分片发送时，服务器会基于不完整的请求就响应 | ✅ CP5 已修（`inbuf` + 定界） |
 | 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
 | 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 keep-alive 之后**只剩这一处**，见上面压测结论 ③ |
-| 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`epoll.cpp`；2.7× 吞吐） |
+| 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`src/epoll.cpp`；2.7× 吞吐） |
 | 5 | `send` 未处理部分写 | 响应很大时可能发不完整 | ⬜ CP6d-3 故意留着（当前响应 117 字节，**撞不到**，写不出会红的测试） |
 | 6 | 没有日志系统、没有优雅退出 | 只用 `std::cout`；`Ctrl+C` 直接终止 | ⬜ 后续 |
 | 7 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 未验证的猜想：它可能正在压着吞吐上限。要验证就造一个"关掉日志"的变体对比 |
@@ -144,44 +168,38 @@ BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 ke
 
 ```
 .
-├── p2.cpp                     ← 阻塞版服务器（CP1 ~ CP5）：一次只能服务一条连接
-├── epoll.cpp                  ← 单线程 Reactor 版（CP6a ~ CP6d）：一个线程 + 一个 epoll
-├── thread.cpp                 ← 单 Reactor + 线程池版：主线程管 IO，工人算业务
-├── http.hpp                   ← 上面三个服务器【共用】的 HTTP 逻辑
-│                                （ClientContext / 解析 / 拼响应 / 线程安全日志）
-├── thread_pool.hpp            ← 线程池类（只有一份，两个文件 include 它）
-├── thread_pool.cpp            ← 线程池独立演示（不接服务器，10 个假任务看怎么分）
-├── README.md
-├── .clang-format              ← 代码风格约束（缩进 4 空格、指针贴左…）
+├── src/                        ← 源码（全部 C++17）
+│   ├── p2.cpp                  阻塞版服务器（CP1~CP5）：一次只能服务一条连接
+│   ├── epoll.cpp               单线程 Reactor 版（CP6a~CP6d）：一个线程 + 一个 epoll
+│   ├── thread.cpp              单 Reactor + 线程池版：主线程管 IO，工人算业务
+│   ├── lib_server.cpp          cpp-httplib 对照版（真实代码 40 行）
+│   ├── http.hpp                三个手写服务器【共用】的 HTTP 逻辑
+│   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
+│   ├── thread_pool.hpp         线程池类（只有一份，两个文件 include 它）
+│   └── thread_pool.cpp         线程池独立演示（不接服务器，10 个假任务看怎么分）
+├── third_party/
+│   └── cpp-httplib/
+│       └── httplib.h           第三方单头文件（23,368 行，vendored 进仓库）
+├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
+├── notes/                      ← 笔记（7 份，见下）
+├── tests/                      ← 测试（4 套 Python + 压测驱动）
+├── .github/workflows/ci.yml    CI：严格编译 + 跑 4 套测试
+├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
-├── .github/workflows/ci.yml   ← CI：严格编译 + 跑 4 套测试（36 项）
-├── notes/
-│   ├── HANDOFF.md             项目笔记：现状 / 踩坑 / 下一步（自己回来先读这份）
-│   ├── learning_progress.md   进度 / 方法论 15 条 / 概念清单
-│   ├── epoll_notes.md         epoll 专题（三件套 / EAGAIN 四态 / LT vs ET）
-│   ├── pitfalls.md            全部踩坑 CP1~CP6d + 元教训
-│   ├── selfcheck.md           自检 69 题（题 + 答案）
-│   ├── stress.md              压测【数字】（p2 + epoll + thread 三批）
-│   └── loadtest_guide.md      压测【方法】（测什么 / 怎么看 / 观察什么）
-└── tests/
-    ├── p2_test.py             23 项【协议正确性】三个服务器都跑
-    ├── balance_test.py        4 项【资源配平】fd + 账本（要 --pid 和 --log）
-    ├── keepalive_test.py      7 项【keep-alive】自己起服务器
-    ├── emfile_test.py         2 项【EMFILE 不空转】自己起服务器
-    ├── load_test.sh           JMeter 压测驱动（压线程池版：BIN=./thread SRC=thread.cpp）
-    ├── analyze.sh             压测结果分析
-    ├── http_load.jmx          JMeter 测试计划
-    └── results/               压测产物（已 gitignore）
+└── README.md
 ```
+
+> 📌 **产物全在 `build/`**：源码旁边永远是干净的。清理只需 `rm -rf build`。
+> 重编：见下面「编译运行」。
 
 **三个服务器怎么选**：
 
 | 想干什么 | 用哪个 |
 | --- | --- |
-| 看最朴素的阻塞写法（对照用） | `./p2` |
-| 看事件驱动、跑协议/配平测试 | `./epoll` |
-| 看线程池怎么和 epoll 配合 | `./thread --workers 4` |
-| 单独把线程池跑起来看 | `./thread_pool` |
+| 看最朴素的阻塞写法（对照用） | `build/p2` |
+| 看事件驱动、跑协议/配平测试 | `build/epoll` |
+| 看线程池怎么和 epoll 配合 | `build/thread --workers 4` |
+| 单独把线程池跑起来看 | `build/thread_pool` |
 
 ## 学习笔记索引
 

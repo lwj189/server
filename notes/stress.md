@@ -1,8 +1,8 @@
 # 压测数据（JMeter）
 
 > 这是本项目**唯一的性能数据**，别埋着。
-> 两批数据：**① `p2.cpp`（阻塞 + backlog=3）** 在第 1 节；
-> **② `epoll.cpp`（事件驱动 + keep-alive）** 在第 2 节（2026-10-04 测）。
+> 两批数据：**① `src/p2.cpp`（阻塞 + backlog=3）** 在第 1 节；
+> **② `src/epoll.cpp`（事件驱动 + keep-alive）** 在第 2 节（2026-10-04 测）。
 > 重跑：`tests/load_test.sh`（驱动）→ `tests/analyze.sh`（出统计表）
 
 ---
@@ -24,7 +24,7 @@ int main() {
 }
 
 压测：
-1 被测版本：p2.cpp（单线程阻塞 + backlog=3）
+1 被测版本：src/p2.cpp（单线程阻塞 + backlog=3）
 2 环境：4核VM，ubuntu，somaxconn=4096，ulimit -n=524288
 3 工具：JMeter 5.6.3（同机压测 → 绝对值仅供参考）
   ⚠ JMeter 自己只有 1GB 堆（`jmeter.log` 里的 Max memory=1073741824），
@@ -59,9 +59,9 @@ summary =  40000 in 00:00:05 = 7900.5/s Avg:    12 Min:     0 Max:  2003 Err:   
 2.源码于epoll（事件驱动 + CP6d-1 EMFILE 暂停 + CP6d-2 keep-alive）
 
 跑法（load_test.sh 能切服务器；三个配置各跑一遍，前缀不同不会互相覆盖）：
-BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # e- = 关 keep-alive
-BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # k- = 开 keep-alive
-BIN=./p2    SRC=p2.cpp    TAG=p-                 ./tests/load_test.sh   # p- = p2 同日重跑
+BIN=build/epoll SRC=src/epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # e- = 关 keep-alive
+BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # k- = 开 keep-alive
+BIN=build/p2    SRC=src/p2.cpp    TAG=p-                 ./tests/load_test.sh   # p- = p2 同日重跑
 
 ⚠ 所有数字的原始 .jtl 都在 tests/results/ 里，看前缀就知道是哪个配置。
    下面的数字【全部用 analyze.sh 同一把尺子】算出来（原因见文末"两把尺子"）。
@@ -113,7 +113,7 @@ k- 那一整轮的收尾观测：accept 连接数 = 761（= 1+10+50+100+200+400�
    → 本项目所有对比一律用 analyze.sh 的数字（README 里 p2 那张旧表用的是
      JMeter summary，所以它和 epoll 的表**不能直接相除**）。
 
-未验证的猜想（留着以后验）：epoll.cpp 每个请求写 5 行日志到 stdout，
+未验证的猜想（留着以后验）：src/epoll.cpp 每个请求写 5 行日志到 stdout，
 而 std::endl 会 flush —— 同步阻塞 IO，可能正压着吞吐上限
 （尤其 srv.log 重定向到文件时，实测跑到 400 并发单文件能到 20MB+）。
 要验证就造一个"关掉日志"的变体对比。

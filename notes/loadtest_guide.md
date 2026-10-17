@@ -107,14 +107,14 @@ LEVELS="1:500 20:300 100:200" ./tests/load_test.sh  # 自定义阶梯
 **压哪台服务器**（2026-10-04 起支持切）：
 
 ```bash
-BIN=./epoll SRC=epoll.cpp TAG=e-  KEEPALIVE=false ./tests/load_test.sh   # epoll，关 keep-alive
-BIN=./epoll SRC=epoll.cpp TAG=k-  KEEPALIVE=true  ./tests/load_test.sh   # epoll，开 keep-alive
-BIN=./p2    SRC=p2.cpp    TAG=p-                  ./tests/load_test.sh   # p2 基线
+BIN=build/epoll SRC=src/epoll.cpp TAG=e-  KEEPALIVE=false ./tests/load_test.sh   # epoll，关 keep-alive
+BIN=build/epoll SRC=src/epoll.cpp TAG=k-  KEEPALIVE=true  ./tests/load_test.sh   # epoll，开 keep-alive
+BIN=build/p2    SRC=src/p2.cpp    TAG=p-                  ./tests/load_test.sh   # p2 基线
 ```
 
 | 环境变量 | 含义 | 默认 |
 | --- | --- | --- |
-| `SRC` / `BIN` | 编译哪个源码 / 跑哪个二进制 | `p2.cpp` / `./p2` |
+| `SRC` / `BIN` | 编译哪个源码 / 跑哪个二进制 | `src/p2.cpp` / `build/p2` |
 | `KEEPALIVE` | 透传给 `.jmx` 的 `-Jkeepalive` | `false` |
 | `TAG` | 结果文件名前缀（避免不同配置互相覆盖） | 空 |
 
@@ -129,7 +129,7 @@ BIN=./p2    SRC=p2.cpp    TAG=p-                  ./tests/load_test.sh   # p2 �
 ```bash
 # 终端1（服务器）：
 cd ~/桌面/server
-./epoll                     # 或 ./p2
+build/epoll                     # 或 build/p2
 # 看到 listening on port 8888 ... 就起来了，它会占住这个终端
 
 # 终端2（压测）：

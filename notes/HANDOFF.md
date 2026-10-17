@@ -14,13 +14,13 @@ cd ~/桌面/server
 cat notes/HANDOFF.md                      # ① 读这份文件
 git log --oneline -5                      # ② 看时间线，确认自己走到哪一步了
 
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion p2.cpp -o p2   # ③ 编译 p2（阻塞版）
-./p2 &                                    #    后台跑服务器
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp -o build/p2   # ③ 编译 p2（阻塞版）
+build/p2 &                                    #    后台跑服务器
 python3 tests/p2_test.py                  #    跑测试（应为 23/23 通过）
 kill %1                                   #    收工
 
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion epoll.cpp -o epoll   # ④ epoll 版也要过
-./epoll &                                 #    ⚠ p2 和 epoll 都占 8888，不能同时开
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp -o build/epoll   # ④ epoll 版也要过
+build/epoll &                                 #    ⚠ p2 和 epoll 都占 8888，不能同时开
 python3 tests/p2_test.py                  #    ① 协议正确性（应为 23/23）
 python3 tests/balance_test.py --pid $! --log server.log   # ② 资源配平（应为 4/4）
 kill %1
@@ -97,9 +97,9 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 
 ```
 ~/桌面/server/
-├── p2.cpp              ← 我手写的服务器（阻塞版），CP1~CP5，23 项测试全过
-├── epoll.cpp           ← 事件驱动的 HTTP 服务器（约 515 行）：CP6a~CP6c + CP6d-1/-2
-├── thread.cpp          ← 单 Reactor + 线程池版（主线程管 IO，工人算业务）
+├── src/p2.cpp              ← 我手写的服务器（阻塞版），CP1~CP5，23 项测试全过
+├── src/epoll.cpp           ← 事件驱动的 HTTP 服务器（约 515 行）：CP6a~CP6c + CP6d-1/-2
+├── src/thread.cpp          ← 单 Reactor + 线程池版（主线程管 IO，工人算业务）
 ├── README.md
 ├── .clang-format       ← 代码风格（4 空格缩进 / Attach 括号 / 指针贴左 / 不折行）
 ├── .github/workflows/ci.yml ← CI：严格编译 p2+epoll（有警告即失败），再跑 4 套测试
@@ -126,7 +126,7 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 ```
 
 ⚠ **`p2` 和 `epoll` 都监听 8888**，同时只能开一个。两个测试脚本也都默认连 8888 ——
-跑哪个测试取决于起的是哪个服务器（起 `./epoll` 却跑 `p2_test.py` 会一片红）。
+跑哪个测试取决于起的是哪个服务器（起 `build/epoll` 却跑 `p2_test.py` 会一片红）。
 
 **git**：分支 `main` + `cp5-halfpacket`，已推到 origin。
 **写这份时的最新提交**：CP6b（分机纳入 epoll + fd 配平）—— 哈希跑 `git log --oneline -1` 看。
@@ -208,7 +208,7 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 ✅ CP6b 分机纳入 epoll（conn_fd 非阻塞 + EPOLL_CTL_ADD + 分流 + read 到 EAGAIN + close 配平）
 ✅ CP6c-1 引入 ClientContext + 连接账本（emplace/find/end/erase + 两处哨兵；行为不变）
 ✅ CP6c-2 把 CP5 的状态机搬进 ClientContext（inbuf + tryHandleRequest，回真正的 HTTP）
-   ⚠ 验收标准是 **`p2_test.py` 23/23 对着 `./epoll` 跑** —— 搬迁前实测 0/23，现在 23/23
+   ⚠ 验收标准是 **`p2_test.py` 23/23 对着 `build/epoll` 跑** —— 搬迁前实测 0/23，现在 23/23
 ✅ CP6d-1 EMFILE 忙等：撞 fd 上限后**暂停接收**（`EPOLL_CTL_DEL`），腾出 fd 再恢复
 ✅ CP6d-2 keep-alive：一条连接服务多个请求（`want_close` + `inbuf.erase` + 循环解析）
 ▶  下一步 CP6d-3：部分写（`send` 返回 < n → 输出缓冲 + `EPOLLOUT`）
@@ -287,7 +287,7 @@ echo 用例随 CP6c-2 退役，详见下一节）
 
 | | 测什么 | 命令 | 结果 |
 | --- | --- | --- | --- |
-| `tests/p2_test.py` | **协议正确性**（回答对不对） | 对着 `./epoll` 跑 | **23/23** |
+| `tests/p2_test.py` | **协议正确性**（回答对不对） | 对着 `build/epoll` 跑 | **23/23** |
 | `tests/balance_test.py` | **资源配平**（东西还没还回去） | `--pid <服务器pid> --log server.log` | **4/4** |
 
 > 📌 **两个轴是正交的，一个全绿不代表另一个绿。** 实测（造坏版本验的）：

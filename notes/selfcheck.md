@@ -318,7 +318,7 @@ RST 后该 fd 变可读，`read` 返回 `-1` + **`ECONNRESET`**；位掩码常�
 
 **56. "不够一个完整请求就 `return false`"这一行，为什么它就是"状态机切片"？**
 因为它把"**等着收全**"从"**堵在函数里**"改成了"**退出函数、把进度留在 `ctx.inbuf` 里**"。
-对比 `p2.cpp`：那边是 `while (read_buffer.size() < total) { read... }` —— 函数**不返回**，进度在**栈上**的局部变量里。
+对比 `src/p2.cpp`：那边是 `while (read_buffer.size() < total) { read... }` —— 函数**不返回**，进度在**栈上**的局部变量里。
 这边**返回**，进度在**堆上**的 `ClientContext` 里；下次事件**重新进函数**、**重头算一遍 `total`**。
 "切片" = 一个连续执行的过程，被切成"**每次事件恢复一点进度**"。
 
@@ -345,7 +345,7 @@ RST 后该 fd 变可读，`read` 返回 `-1` + **`ECONNRESET`**；位掩码常�
 · `EMFILE` = **本进程**的 fd 用光了（The **per-process** limit ... has been reached）
 · `ENFILE` = **整机**所有进程加起来用光了（The **system-wide** limit ... has been reached）
 `ulimit -n` 改的是**这个进程**的上限 → 撞出来的是 `EMFILE`。
-测试里那句 `bash -c 'ulimit -n 64; exec ./epoll'` 压的就是这个数。
+测试里那句 `bash -c 'ulimit -n 64; exec build/epoll'` 压的就是这个数。
 ★ 填错的代价：暂停分支**永远进不去** → 空转照旧（实测日志 **109 万行**）。
 
 **61. 撞到 `EMFILE` 后为什么不能只是 `break`？** 🔥

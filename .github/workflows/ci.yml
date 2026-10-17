@@ -27,21 +27,22 @@ jobs:
       - name: 严格编译 p2.cpp 和 epoll.cpp（有警告就算失败）
         run: |
           FAIL=0
+          mkdir -p build
           for src in p2 epoll; do
-            echo "================ 编译 $src.cpp ================"
-            if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion "$src.cpp" -o "$src" 2> build.log; then
-              echo "::error::$src.cpp 编译失败"
+            echo "================ 编译 src/$src.cpp ================"
+            if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion "src/$src.cpp" -o "build/$src" 2> build.log; then
+              echo "::error::src/$src.cpp 编译失败"
               cat build.log
               FAIL=1
               continue
             fi
             if [ -s build.log ]; then
-              echo "::error::$src.cpp 编译有警告，先修干净再提交"
+              echo "::error::src/$src.cpp 编译有警告，先修干净再提交"
               cat build.log
               FAIL=1
               continue
             fi
-            echo "OK: $src.cpp 编译通过（零错误零警告）"
+            echo "OK: src/$src.cpp 编译通过（零错误零警告）"
           done
           exit $FAIL
 
@@ -109,8 +110,8 @@ jobs:
             done
           }
 
-          run_one p2    tests/p2_test.py
-          run_one epoll tests/p2_test.py tests/balance_test.py
+          run_one build/p2    tests/p2_test.py
+          run_one build/epoll tests/p2_test.py tests/balance_test.py
 
           exit $RC
 

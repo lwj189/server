@@ -124,6 +124,32 @@ int main(int argc, char** argv) {
 
     httplib::Server svr;
 
+    // ★ 必须显式设 SO_REUSEADDR —— 库的默认值在这里有个坑（实测踩到，不是猜的）
+    //
+    //   httplib 的 default_socket_options() 原文：
+    //       #ifdef SO_REUSEPORT
+    //           set_socket_opt(sock, SOL_SOCKET, SO_REUSEPORT, 1);
+    //       #else
+    //           set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+    //       #endif
+    //
+    //   Linux 上 SO_REUSEPORT 是【有定义】的 → 所以它只设了 REUSEPORT，
+    //   根本没设 REUSEADDR。
+    //
+    //   而两者不是一回事：
+    //     · SO_REUSEADDR：允许 bind 一个【还有 TIME_WAIT 残留】的端口  ← 我们要的
+    //     · SO_REUSEPORT：允许多个进程【同时监听】同一端口（多 Reactor 用）
+    //
+    //   现象：跑完一轮测试后 8888 上积了 641 个 TIME_WAIT，库版启动直接失败
+    //         "监听 8888 失败（端口被占？）"，而手写版（p2/epoll/thread）全都
+    //         显式设了 SO_REUSEADDR，所以照样能起。
+    //   → 换端口（9999）也证明不是代码问题：空端口一次就起来了。
+    svr.set_socket_options([](int sock) {
+        int yes = 1;
+        ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                     static_cast<const void*>(&yes), sizeof(yes));
+    });
+
     // 运行时设上限 —— 比宏更可靠（宏那个我实测没生效，见文件顶部注释）
     svr.set_payload_max_length(1024 * 1024);   // 1MB，对齐手写版
     svr.set_read_timeout(5, 0);

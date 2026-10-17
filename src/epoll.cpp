@@ -1,8 +1,8 @@
 // ===========================================================================
-// epoll.cpp：单线程 Reactor 版 HTTP 服务器（基线实现）
+// src/epoll.cpp：单线程 Reactor 版 HTTP 服务器（基线实现）
 //
-// HTTP 的解析 / 拼响应 / 每条连接的状态，全部在 http.hpp 里 ——
-// 那部分和"用什么并发模型"无关，所以和 thread.cpp（线程池版）共用一份。
+// HTTP 的解析 / 拼响应 / 每条连接的状态，全部在 src/http.hpp 里 ——
+// 那部分和"用什么并发模型"无关，所以和 src/thread.cpp（线程池版）共用一份。
 // 本文件只负责【并发模型】：一个线程 + 一个 epoll 实例照看所有连接。
 // ===========================================================================
 #include "http.hpp"        // ClientContext / parseRequest / buildResponse / logLine
@@ -23,13 +23,13 @@
 
 constexpr uint16_t PORT = 8888;   // 监听端口
 
-// ClientContext（每条连接的状态：fd / inbuf / want_close）已经搬到 http.hpp ——
+// ClientContext（每条连接的状态：fd / inbuf / want_close）已经搬到 src/http.hpp ——
 // 线程池版也要用它，所以不能只留在这一个文件里。
 
-// 三个纯函数（toLowerAscii / findHeader / isAllDigits）也已经搬到 http.hpp。
+// 三个纯函数（toLowerAscii / findHeader / isAllDigits）也已经搬到 src/http.hpp。
 
 // ===========================================================================
-// 处理一个完整请求：解析（借 http.hpp）→ 发响应 → 消费掉 inbuf 里的字节
+// 处理一个完整请求：解析（借 src/http.hpp）→ 发响应 → 消费掉 inbuf 里的字节
 //
 // 返回值：true  = 已经有结果了（响应发了 / 或这条连接该被丢弃）→ 调用方收连接
 //         false = 还不够一个完整请求 → 等下次 EPOLLIN 再进来接着算
@@ -45,7 +45,7 @@ static bool tryHandleRequest(ClientContext& ctx) {
     }
     if (pr.result == ParseResult::Rejected) {
         // 请求非法（头过大 / Content-Length 非法…）：ctx.want_close 已被置 true。
-        // 【什么都不回】，直接让调用方收掉连接 —— 和 p2.cpp 的行为一致。
+        // 【什么都不回】，直接让调用方收掉连接 —— 和 src/p2.cpp 的行为一致。
         return true;
     }
 

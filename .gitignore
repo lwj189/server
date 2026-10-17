@@ -11,7 +11,7 @@ p4
 epoll
 thread
 thread_pool
-lib_server
+p2_lib
 
 # 编译中间文件
 *.o

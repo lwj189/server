@@ -1,10 +1,10 @@
 // ===========================================================================
-// http.hpp：HTTP 解析 / 响应构造 —— 与"用什么并发模型"无关的部分
+// src/http.hpp：HTTP 解析 / 响应构造 —— 与"用什么并发模型"无关的部分
 //
 // 为什么要把这些抽出来？
 //   项目里现在有两个服务器：
-//     · epoll.cpp       单线程 Reactor          （基线，36 项测试守着它）
-//     · thread.cpp 单 Reactor + 线程池     （简历主角）
+//     · src/epoll.cpp       单线程 Reactor          （基线，36 项测试守着它）
+//     · src/thread.cpp 单 Reactor + 线程池     （简历主角）
 //   两者的【并发模型】完全不同，但【HTTP 怎么解析、响应怎么拼】一模一样。
 //   抄两份的话，改一处忘一处，两份代码迟早漂移 —— 所以抽到这个头文件。
 //
@@ -24,7 +24,7 @@
 #include <mutex>      // std::mutex / std::lock_guard（多线程日志用）
 #include <string>     // std::string
 
-// ★【DoS 保护】请求头 / 请求体大小上限（和 p2.cpp 同一套值）
+// ★【DoS 保护】请求头 / 请求体大小上限（和 src/p2.cpp 同一套值）
 //   没有上限的实现会被"一直发数据、永远不发 \r\n\r\n"的客户端吊死（内存涨爆）。
 //   MAX_HEADER_SIZE = 8 KB 与 nginx 的 large_client_header_buffers 同量级；
 //   MAX_BODY_SIZE = 1 MB 与 nginx 的 client_max_body_size 默认值一致。
@@ -49,8 +49,8 @@ static void logLine(const std::string& line) {
 }
 
 // 压测开关：每个请求都打日志（还带 flush）会成为瓶颈。
-// thread.cpp 用 --quiet 关掉它。
-// ⚠ [[maybe_unused]] 不能省：epoll.cpp 是单线程的、没解析 argv，用不到这个开关，
+// src/thread.cpp 用 --quiet 关掉它。
+// ⚠ [[maybe_unused]] 不能省：src/epoll.cpp 是单线程的、没解析 argv，用不到这个开关，
 //   而 CI 是"有警告即失败" —— 没有这个属性就会报 -Wunused-variable。
 [[maybe_unused]] static bool g_log_requests = true;
 
@@ -82,17 +82,17 @@ struct ClientContext {
     //     false = 留着，继续服务后面的请求（HTTP/1.1 的默认行为）
     bool want_close = false;
 
-    // ---- 只在 thread.cpp（单 Reactor + 线程池）里用得到 ----
+    // ---- 只在 src/thread.cpp（单 Reactor + 线程池）里用得到 ----
     // true = 这条连接的 fd 已经从 epoll 摘掉、正躺在工人手里。
     // 主线程看到 busy 就必须【完全别碰它】—— 不 read、不解析、不关，
     // 否则就是两个线程同时操作同一个 fd（数据竞争 / use-after-close）。
     //
-    // epoll.cpp 是单线程的，这个字段永远是 false，不影响它任何行为。
+    // src/epoll.cpp 是单线程的，这个字段永远是 false，不影响它任何行为。
     bool busy = false;
 };
 
 // ===========================================================================
-// 下面三个纯函数是从 p2.cpp 原样搬过来的
+// 下面三个纯函数是从 src/p2.cpp 原样搬过来的
 //
 // 它们不依赖 socket、不依赖 epoll —— 输入一段字符串，输出解析结果。
 // 正因为是纯函数，"搬家"才这么省事：换个文件照样能用、一个字都不用改。
@@ -156,14 +156,14 @@ static bool isAllDigits(const std::string& s) {
 // 解析：从 ctx.inbuf 里取出【一个完整请求】
 //
 // 这是"状态机切片"最直观的一处：
-//   p2.cpp：一个 while 循环堵在那里读到收全为止（连续执行，栈上有 read_buffer）
+//   src/p2.cpp：一个 while 循环堵在那里读到收全为止（连续执行，栈上有 read_buffer）
 //   这里  ：每次事件调用一次，不够就【原地返回】，进度留在 ctx.inbuf 里
 //
 // 三种结果，调用方必须区别对待：
 //   NeedMore —— 还不够一个完整请求，等下次事件（什么都不做）
 //   Ready    —— out.raw / out.total 有效，调用方去发响应 + 消费字节
 //   Rejected —— 请求非法（头过大 / Content-Length 非法…），ctx.want_close 已置 true；
-//               调用方【直接收掉连接，不要回任何东西】（和 p2.cpp 的行为一致）
+//               调用方【直接收掉连接，不要回任何东西】（和 src/p2.cpp 的行为一致）
 // ===========================================================================
 enum class ParseResult { NeedMore, Ready, Rejected };
 
@@ -180,7 +180,7 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
     const size_t header_end = ctx.inbuf.find("\r\n\r\n");
     if (header_end == std::string::npos) {
         // 头部还没收全。但别无限等 —— 对方可能永远不发定界符（DoS）。
-        // ⚠ 判断顺序和 p2.cpp 一致：先看"收全没有"，再看"超限"。
+        // ⚠ 判断顺序和 src/p2.cpp 一致：先看"收全没有"，再看"超限"。
         //   反过来会把"头很小但 body 很大"的合法请求误杀。
         if (ctx.inbuf.size() > MAX_HEADER_SIZE) {
             logLine("请求头过大 —— 丢弃 fd=" + std::to_string(ctx.fd));

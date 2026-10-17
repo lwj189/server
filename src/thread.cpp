@@ -1,10 +1,10 @@
 // ===========================================================================
-// thread.cpp：单 Reactor + 线程池
+// src/thread.cpp：单 Reactor + 线程池
 //
-// 和 epoll.cpp 的唯一区别是【谁来干活】：
+// 和 src/epoll.cpp 的唯一区别是【谁来干活】：
 //
-//   epoll.cpp       主线程：收连接 → 读 → 解析 → 算业务 → 发响应   （全程一个线程）
-//   thread.cpp 主线程：收连接 → 读 → 解析 ──┐
+//   src/epoll.cpp       主线程：收连接 → 读 → 解析 → 算业务 → 发响应   （全程一个线程）
+//   src/thread.cpp 主线程：收连接 → 读 → 解析 ──┐
 //                                              └→ 线程池：算业务 → 发响应
 //
 // 为什么要这么拆？
@@ -30,10 +30,10 @@
 //     没有它，keep-alive 就没了（一条连接只能服务一个请求）。
 //
 // 编译运行（-pthread 必须加）：
-//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread.cpp -o thread -pthread
-//     ./thread                       # 4 个工人 + 每请求日志
-//     ./thread --workers 1           # 只开 1 个工人（用来证明"多核真的有用"）
-//     ./thread --quiet               # 关掉每请求日志（压测时用）
+//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp -o build/thread -pthread
+//     build/thread                       # 4 个工人 + 每请求日志
+//     build/thread --workers 1           # 只开 1 个工人（用来证明"多核真的有用"）
+//     build/thread --quiet               # 关掉每请求日志（压测时用）
 // ===========================================================================
 
 #include "http.hpp"          // ClientContext / parseRequest / buildResponse / logLine
@@ -124,7 +124,7 @@ static std::string doBusiness(const std::string& raw) {
     const std::string target = requestTarget(raw);
 
     if (target.rfind("/work", 0) != 0) {
-        // 普通请求：和 epoll.cpp 返回完全一样的东西
+        // 普通请求：和 src/epoll.cpp 返回完全一样的东西
         // （这样 p2_test.py 那 23 项协议测试对两个服务器都成立）
         return "<h1>Hello from my own server!</h1>";
     }
@@ -328,7 +328,7 @@ int main(int argc, char** argv) {
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(server_fd, SOMAXCONN) < 0) {   // backlog 拉满（和 epoll.cpp 同一个教训）
+    if (listen(server_fd, SOMAXCONN) < 0) {   // backlog 拉满（和 src/epoll.cpp 同一个教训）
         perror("listen"); return 1;
     }
 
@@ -358,7 +358,7 @@ int main(int argc, char** argv) {
     size_t paused_at = 0;
 
     while (true) {
-        // EMFILE 撞墙后的恢复判断（和 epoll.cpp 同一套）
+        // EMFILE 撞墙后的恢复判断（和 src/epoll.cpp 同一套）
         if (accept_paused) {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             if (g_clients.size() < paused_at) {

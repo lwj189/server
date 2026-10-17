@@ -1,11 +1,11 @@
 // ===========================================================================
-// lib_server.cpp：第四个版本 —— 用 cpp-httplib 实现（对照组）
+// src/p2_lib.cpp：第四个版本 —— 用 cpp-httplib 实现（对照组）
 //
 // 为什么要它？
 //   项目里已经有三个【手写】的服务器：
-//     p2.cpp     阻塞串行        335 行
-//     epoll.cpp  单线程 Reactor   367 行
-//     thread.cpp 单 Reactor + 线程池 492 行
+//     src/p2.cpp     阻塞串行        335 行
+//     src/epoll.cpp  单线程 Reactor   367 行
+//     src/thread.cpp 单 Reactor + 线程池 492 行
 //   这一版用现成的库实现同一个功能，完整代码 【9 行】。
 //
 //   放在一起跑同一套测试、同一个压测，才能回答一个真问题：
@@ -22,20 +22,20 @@
 //   ┌─────────────────────────┬──────────────────────┬─────────────────────┐
 //   │ 这一层                  │ 手写版（你写的）      │ cpp-httplib         │
 //   ├─────────────────────────┼──────────────────────┼─────────────────────┤
-//   │ socket/bind/listen      │ p2.cpp 步骤 1~5      │ 库内部              │
-//   │ accept 循环             │ p2.cpp 步骤 6        │ 库内部（线程池）     │
+//   │ socket/bind/listen      │ src/p2.cpp 步骤 1~5      │ 库内部              │
+//   │ accept 循环             │ src/p2.cpp 步骤 6        │ 库内部（线程池）     │
 //   │ read 到完整请求         │ 每连接缓冲区 + 循环   │ 库内部              │
 //   │ \r\n\r\n 定界           │ findHeader           │ 库内部              │
 //   │ Content-Length + 上限   │ MAX_HEADER/BODY_SIZE │ 库内部（有默认值）   │
 //   │ 拼 HTTP 响应            │ buildResponse        │ res.set_content     │
-//   │ epoll 事件循环          │ epoll.cpp 全部       │ 无（每连接一线程）   │
+//   │ epoll 事件循环          │ src/epoll.cpp 全部       │ 无（每连接一线程）   │
 //   │ keep-alive              │ want_close + erase   │ 库内部              │
 //   │ EMFILE / 配平 / 哨兵    │ 你踩过的那些坑        │ 库内部              │
 //   └─────────────────────────┴──────────────────────┴─────────────────────┘
 //
 //   ⚠ 关键区别：cpp-httplib **不是 epoll**。它用的是"每连接一个线程 + 阻塞 IO"
 //     （内部有个线程池，默认线程数 = CPU 核数）。
-//     所以它【没有】你 epoll.cpp 里的那些东西：
+//     所以它【没有】你 src/epoll.cpp 里的那些东西：
 //       · 没有 epoll 三件套    · 没有非阻塞 fd / EAGAIN
 //       · 没有 ClientContext   · 没有 EPOLL_CTL_DEL / ADD 的交接
 //     连接数一多，它就卡在"线程数"上 —— 这正是 epoll 存在的理由。
@@ -45,17 +45,17 @@
 // ===========================================================================
 //
 //   编译（单头文件，不需要链接任何库）：
-//       g++ -std=c++17 -O2 lib_server.cpp -o lib_server -pthread
+//       g++ -std=c++17 -O2 src/p2_lib.cpp -o build/p2_lib -pthread
 //
-//   ⚠ 第一次编译会慢（30~60 秒）：httplib.h 有 2.3 万行，预处理和模板实例化都在这。
+//   ⚠ 第一次编译会慢（30~60 秒）：third_party/cpp-httplib/httplib.h 有 2.3 万行，预处理和模板实例化都在这。
 //     之后改了代码重编会快一些（`-O2` 帮了不少忙）。
 //
 //   运行：
-//       ./lib_server
-//       ./lib_server --port 9999
+//       build/p2_lib
+//       build/p2_lib --port 9999
 //
 //   测试（和另外三个版本完全一样）：
-//       ./lib_server &
+//       build/p2_lib &
 //       python3 tests/p2_test.py
 //       python3 tests/balance_test.py --pid $! --log server.log
 //

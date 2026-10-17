@@ -22,7 +22,7 @@ CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 | `src/p2.cpp` | 阻塞串行（一次一条连接） | 172 |
 | `src/epoll.cpp` | 单线程 Reactor | 194 |
 | `src/thread.cpp` | 单 Reactor + 线程池 | 317 |
-| `src/lib_server.cpp` | cpp-httplib（库，每连接一线程） | 40 |
+| `src/p2_lib.cpp` | cpp-httplib（库，每连接一线程） | 40 |
 | `src/thread_pool.cpp` | 线程池独立演示（不接服务器） | — |
 
 ## 编译与运行
@@ -39,12 +39,12 @@ g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp -o build/thr
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_pool.cpp -o build/thread_pool -pthread
 
 # 库版（-I 指向第三方头文件；第一次编译约 8 秒，模板实例化）
-g++ -std=c++17 -O2 src/lib_server.cpp -o build/lib_server -pthread -I third_party/cpp-httplib
+g++ -std=c++17 -O2 src/p2_lib.cpp -o build/p2_lib -pthread -I third_party/cpp-httplib
 
 # 起一个（⚠ 都占 8888，同时只能跑一个）
 ./build/epoll                                  # 或 ./build/p2
 ./build/thread --workers 4                     # 线程池版
-./build/lib_server                             # cpp-httplib 版（支持 --port N）
+./build/p2_lib                             # cpp-httplib 版（支持 --port N）
 ```
 
 端口：手写版在各自源码顶部的 `constexpr uint16_t PORT`；库版用 `--port N`。
@@ -172,7 +172,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 │   ├── p2.cpp                  阻塞版服务器（CP1~CP5）：一次只能服务一条连接
 │   ├── epoll.cpp               单线程 Reactor 版（CP6a~CP6d）：一个线程 + 一个 epoll
 │   ├── thread.cpp              单 Reactor + 线程池版：主线程管 IO，工人算业务
-│   ├── lib_server.cpp          cpp-httplib 对照版（真实代码 40 行）
+│   ├── p2_lib.cpp          cpp-httplib 对照版（真实代码 40 行）
 │   ├── http.hpp                三个手写服务器【共用】的 HTTP 逻辑
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   ├── thread_pool.hpp         线程池类（只有一份，两个文件 include 它）

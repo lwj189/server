@@ -1,5 +1,5 @@
 // ===========================================================================
-// thread_pool.cpp：线程池【独立演示】
+// src/thread_pool.cpp：线程池【独立演示】
 //
 // 这个文件是拿来"单独把线程池跑起来看"的 —— 不接服务器，没有 socket，
 // 就 10 个假任务丢进去，看它们怎么被 4 个工人分掉。
@@ -9,13 +9,13 @@
 //   出了问题根本分不清是池子的锅还是服务器的锅。
 //   先把池子单独跑通（能创建、能派活、能优雅退出），再接进服务器。
 //
-// ★ ThreadPool 类本身在 thread_pool.hpp 里（只有一份）——
-//   这个文件和 thread.cpp（服务器）include 的是同一个类。
+// ★ ThreadPool 类本身在 src/thread_pool.hpp 里（只有一份）——
+//   这个文件和 src/thread.cpp（服务器）include 的是同一个类。
 //   （以前这里抄了一份类定义，两份代码迟早会漂移，已经改掉了）
 //
 // 编译运行：
-//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread_pool.cpp -o thread_pool -pthread
-//     ./thread_pool
+//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_pool.cpp -o build/thread_pool -pthread
+//     build/thread_pool
 //
 //   ⚠ -pthread 必须加：不加的话 std::thread 能编译通过，但链接会报错
 // ===========================================================================

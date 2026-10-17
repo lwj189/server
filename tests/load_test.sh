@@ -124,3 +124,15 @@ echo "==> TIME_WAIT 残留（服务器先 close，所以它自己攒 60 秒）: 
 echo "==> 服务器 accept 的连接数: $(grep -c '新连接' "$OUTDIR/srv.log")"
 echo "    结果文件：$OUTDIR/"
 echo "    HTML 报告：$JMETER -g $OUTDIR/${LABEL}.jtl -o $OUTDIR/report"
+
+# ---------------- 6. 清掉本次运行的"过程日志" ----------------
+# 为什么必须由脚本自己清：srv.log 是服务器的 stdout，而 epoll.cpp 每处理一个请求
+# 就写 5 行日志 —— 跑到 400 并发那一档，单个 srv.log 能到 20MB+。
+# 它只是过程日志，数字全在 .jtl 里；不清的话 results/ 跑几次就爆（实测清完 31M，
+# 重跑两轮又回到 49M）。想留着排查就 KEEP_LOGS=1。
+#
+# ⚠ .jtl 一律【不清】：那是所有数字的唯一证据（notes/stress.md 引用它们）。
+if [ "${KEEP_LOGS:-0}" != "1" ]; then
+    rm -f "$OUTDIR/srv.log" "$OUTDIR/build.log" "$OUTDIR"/*.jmeter.log
+    echo "==> 已清掉过程日志（srv.log / build.log / *.jmeter.log）—— 要保留请加 KEEP_LOGS=1"
+fi

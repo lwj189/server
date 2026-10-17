@@ -1,9 +1,14 @@
+// ===========================================================================
+// epoll.cpp：单线程 Reactor 版 HTTP 服务器（基线实现）
+//
+// HTTP 的解析 / 拼响应 / 每条连接的状态，全部在 http.hpp 里 ——
+// 那部分和"用什么并发模型"无关，所以和 thread.cpp（线程池版）共用一份。
+// 本文件只负责【并发模型】：一个线程 + 一个 epoll 实例照看所有连接。
+// ===========================================================================
+#include "http.hpp"        // ClientContext / parseRequest / buildResponse / logLine
+
 #include <iostream>        // std::cout / std::endl
 #include <cstdint>         // uint16_t
-#include <cstddef>         // size_t
-#include <string>          // std::string（CP6c-2：inbuf / 请求文本）
-#include <cctype>          // std::tolower
-#include <exception>       // std::exception（stoull 溢出时抛的那个）
 #include <cerrno>          // errno / EAGAIN / EWOULDBLOCK / EINTR
 #include <csignal>         // signal / SIGPIPE / SIG_IGN
 #include <sys/socket.h>    // socket / bind / listen / setsockopt / accept / sockaddr
@@ -13,202 +18,42 @@
 #include <arpa/inet.h>     // inet_ntop
 #include <fcntl.h>         // fcntl / F_GETFL / F_SETFL / O_NONBLOCK
 #include <sys/epoll.h>     // epoll_create1 / epoll_ctl / epoll_wait / struct epoll_event
-#include <unordered_map>   // std::unordered_map（CP6c：fd → 连接状态）
+#include <unordered_map>   // std::unordered_map（fd → 连接状态）
+#include <string>          // std::string / std::to_string
 
 constexpr uint16_t PORT = 8888;   // 监听端口
 
-// ★【DoS 保护】请求头 / 请求体大小上限（和 p2.cpp 同一套值）
-//   没有上限的实现会被"一直发数据、永远不发 \r\n\r\n"的客户端吊死（内存涨爆）。
-//   MAX_HEADER_SIZE = 8 KB 与 nginx 的 large_client_header_buffers 同量级；
-//   MAX_BODY_SIZE = 1 MB 与 nginx 的 client_max_body_size 默认值一致。
-constexpr size_t MAX_HEADER_SIZE = 8 * 1024;
-constexpr size_t MAX_BODY_SIZE = 1024 * 1024;
+// ClientContext（每条连接的状态：fd / inbuf / want_close）已经搬到 http.hpp ——
+// 线程池版也要用它，所以不能只留在这一个文件里。
+
+// 三个纯函数（toLowerAscii / findHeader / isAllDigits）也已经搬到 http.hpp。
 
 // ===========================================================================
-// CP6c：每条连接的状态
-//
-// 为什么需要它？
-//   CP6a / CP6b 里"一条连接"就只是一个 fd 号 —— 连接相关的所有东西都活在
-//   事件处理的【栈帧】里，事件一处理完就烟消云散。
-//   一旦要处理半包 / 粘包（CP5 那套），就必须把"这条连接已经收到哪儿了"存下来，
-//   而栈帧留不住它 → 状态必须从栈上搬到外面的容器里。
-//
-//   这就是"状态机切片"：把"一个连续执行的函数"改造成"每次事件恢复一点进度"，
-//   所以"进度"得有个地方放。
-// ===========================================================================
-struct ClientContext {
-    int fd = -1;
-
-    // ---- CP6c-2 新增：这条连接自己的读缓冲区 ----
-    // 为什么必须是"每条连接一个"：TCP 是字节流，一次 read 拿到的可能只是半个请求。
-    // 半个请求得先存着，等剩下的到了再拼起来 —— 而"等"意味着函数要返回，
-    // 栈上的局部变量活不到下一次事件，所以只能存在这里。
-    // （p2.cpp 里它是 main 循环里的一个局部 std::string，一次只服务一条连接，
-    //   所以放栈上够用；epoll 版同时持有很多条，就必须一人一个。）
-    std::string inbuf;
-
-    // ---- CP6d 新增：这条连接【回完当前请求之后】要不要关？----
-    // 谁说了算：客户端在请求头里说（去看 tests/p2_test.py 第 45 行，它带了什么字段）。
-    // 出错的连接也必须关（头过大 / Content-Length 非法 …），也是靠这个成员。
-    //     true  = 该关了（客户端要求，或这条连接被判为非法）
-    //     false = 留着，继续服务后面的请求（HTTP/1.1 的默认行为）
-    //
-    bool want_close = false;
-};
-
-// ===========================================================================
-// CP6c-2：下面三个纯函数是从 p2.cpp 原样搬过来的（CP5 的成果，不用重写）
-//
-// 它们不依赖 socket、不依赖 epoll —— 输入一段字符串，输出解析结果。
-// 正因为是纯函数，"搬家"才这么省事：换个文件照样能用。
-// ===========================================================================
-
-// 只转 ASCII 小写。为什么不用真 Unicode 小写：HTTP 头字段名限定为 ASCII token，
-// 而且 std::tolower 的参数必须是 unsigned char 的值（负数进去是未定义行为）。
-static std::string toLowerAscii(const std::string& s) {
-    std::string out = s;
-    for (char& c : out) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return out;
-}
-
-// 在"头部区域"[0, header_end) 内查找字段 name，找到就返回值（已去掉两端空白）。
-// 三个协议细节：① 字段名大小写不敏感（RFC 9110 §5.1）
-//              ② 冒号后的 OWS 可为 0 个（RFC 9112 §5）
-//              ③ 只在头部区域内找 —— 否则 body 里的同名文本会把解析器骗到
-static bool findHeader(const std::string& buf, size_t header_end,
-                       const std::string& name, std::string& value) {
-    const std::string want = toLowerAscii(name);
-    size_t pos = 0;
-
-    while (pos < header_end) {
-        size_t line_end = buf.find("\r\n", pos);
-        if (line_end == std::string::npos || line_end > header_end) {
-            line_end = header_end;   // 防御：绝不读越过头部区域
-        }
-
-        const std::string line = buf.substr(pos, line_end - pos);
-        const size_t colon = line.find(':');
-        if (colon != std::string::npos && toLowerAscii(line.substr(0, colon)) == want) {
-            size_t v = colon + 1;
-            while (v < line.size() && (line[v] == ' ' || line[v] == '\t')) ++v;   // 跳过 OWS
-            value = line.substr(v);
-            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-                value.pop_back();
-            }
-            return true;
-        }
-
-        if (line_end >= header_end) break;
-        pos = line_end + 2;   // +2 跳过 CRLF
-    }
-    return false;
-}
-
-// 整个字符串都是十进制数字？（空串不算）
-// 为什么要它：std::stoull 是"解析到非数字就停"，stoull("10abc") 会返回 10 ——
-// 非法值被当成合法值接受了（RFC 9112 §6.3 要求这种情况以 400 拒绝）。
-static bool isAllDigits(const std::string& s) {
-    if (s.empty()) return false;
-    for (char c : s) {
-        if (c < '0' || c > '9') return false;
-    }
-    return true;
-}
-
-// ===========================================================================
-// CP6c-2 的心脏：从 ctx.inbuf 里取出【一个完整请求】并响应
-//
-// 对比 p2.cpp 的同款逻辑 —— 这是"状态机切片"最直观的一处：
-//   p2.cpp：一个 while 循环堵在那里读到收全为止（连续执行，栈上有 read_buffer）
-//   这里  ：每次事件调用一次，不够就【原地返回】，进度留在 ctx.inbuf 里
+// 处理一个完整请求：解析（借 http.hpp）→ 发响应 → 消费掉 inbuf 里的字节
 //
 // 返回值：true  = 已经有结果了（响应发了 / 或这条连接该被丢弃）→ 调用方收连接
 //         false = 还不够一个完整请求 → 等下次 EPOLLIN 再进来接着算
+//
+// ⚠ 这个返回值【不是】"成功 / 失败"：请求非法（Rejected）同样返回 true，
+//   因为那条连接也"有结果了" —— 该被收掉。
 // ===========================================================================
 static bool tryHandleRequest(ClientContext& ctx) {
-    // ---- ① 头部定界：找 \r\n\r\n（RFC 9112 §2.1）----
-    const size_t header_end = ctx.inbuf.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        // 头部还没收全。但别无限等 —— 对方可能永远不发定界符（DoS）。
-        // ⚠ 判断顺序和 p2.cpp 一致：先看"收全没有"，再看"超限"。
-        //   反过来会把"头很小但 body 很大"的合法请求误杀。
-        if (ctx.inbuf.size() > MAX_HEADER_SIZE) {
-            std::cout << "请求头过大 —— 丢弃 fd=" << ctx.fd << std::endl;
-            ctx.want_close = true;   // 判死刑的连接一律要关（下面 3 处错误分支同理）
-            return true;
-        }
+    const ParsedRequest pr = parseRequest(ctx);
+
+    if (pr.result == ParseResult::NeedMore) {
         return false;   // 还不够，等下次事件
     }
-
-    // ---- ② 解析 Content-Length（CP5 的三个坑由上面两个纯函数解决）----
-    size_t content_len = 0;   // 没有这个头字段就按 0 处理（普通 GET 就是这种）
-    std::string cl_value;
-    if (findHeader(ctx.inbuf, header_end, "Content-Length", cl_value)) {
-        if (!isAllDigits(cl_value)) {
-            std::cout << "Content-Length 非法（不是纯数字）—— 丢弃 fd=" << ctx.fd << std::endl;
-            ctx.want_close = true;
-            return true;
-        }
-        try {
-            const unsigned long long v = std::stoull(cl_value);
-            if (v > MAX_BODY_SIZE) {
-                std::cout << "body 过大（Content-Length=" << v << "）—— 丢弃 fd=" << ctx.fd
-                          << std::endl;
-                ctx.want_close = true;
-                return true;
-            }
-            content_len = static_cast<size_t>(v);
-        } catch (const std::exception&) {
-            std::cout << "Content-Length 溢出 —— 丢弃 fd=" << ctx.fd << std::endl;
-            ctx.want_close = true;
-            return true;
-        }
+    if (pr.result == ParseResult::Rejected) {
+        // 请求非法（头过大 / Content-Length 非法…）：ctx.want_close 已被置 true。
+        // 【什么都不回】，直接让调用方收掉连接 —— 和 p2.cpp 的行为一致。
+        return true;
     }
 
-    // ---- 客户端要不要关连接？（HTTP/1.1 默认复用，客户端说 close 才关）----
-    // 位置讲究：必须在【拼响应之前】问出来，因为响应里的 Connection 头要跟着它走。
-    //
-    // ⚠ 和上面找 Content-Length 只有【前半截】像（都是 findHeader 取值），后半截完全不同：
-    //   那个要"把数字串转成整数"（isAllDigits / stoull / MAX_BODY_SIZE），
-    //   这个只要"比字符串"。照抄形状可以，抄进来的每一行都得知道在干嘛。
-    //
-    // 值可能是 "close" / "keep-alive" / "Close"… → 先 toLowerAscii 再比（RFC 9110 §5.1 大小写不敏感）
-    std::string conn_value;
-    if (findHeader(ctx.inbuf, header_end, "Connection", conn_value) &&
-        toLowerAscii(conn_value) == "close") {
-        ctx.want_close = true;
-    }
-
-    // ---- ③ 一个完整请求 = 头部 + 结尾空行 + body，一共多少字节？----
-    //     header_end 指向 "\r\n\r\n" 的【第一个 \r】，头部内容本身不含这 4 个字节。
-    const size_t total = header_end + 4 + content_len;
-
-    // ---- ④ 收齐了没有？----
-    // 没齐就原地返回 —— 这一行就是"切片"：
-    // 函数退出，进度留在 ctx.inbuf 里，等下一个 EPOLLIN 再进来重新算一遍。
-    if (ctx.inbuf.size() < total) {
-        return false;   // 还不够，等下次事件
-    }
-
-    // ---- ⑤ 收齐了：处理 + 响应（这段从 p2.cpp 原样搬过来）----
-    const std::string request = ctx.inbuf.substr(0, total);
-    std::cout << "收到完整请求:\n"
-              << request << std::endl;
+    // ---- 收齐了：记录 + 响应 ----
+    logLine("收到完整请求:\n" + pr.raw);
 
     const std::string body = "<h1>Hello from my own server!</h1>";
-    // 响应里的 Connection 头跟着 ctx.want_close 走 —— 这一处我写好了，不用你填
-    const std::string conn_header = ctx.want_close ? "Connection: close\r\n"
-                                                   : "Connection: keep-alive\r\n";
-    const std::string response = "HTTP/1.1 200 OK\r\n"
-                                 "Content-Type: text/html\r\n"
-                                 "Content-Length: " +
-                                 std::to_string(body.size()) +
-                                 "\r\n" +
-                                 conn_header +
-                                 "\r\n" +
-                                 body;
+    const std::string response = buildResponse(body, ctx.want_close);
 
     if (send(ctx.fd, response.c_str(), response.size(), 0) < 0) {
         perror("send");
@@ -218,7 +63,7 @@ static bool tryHandleRequest(ClientContext& ctx) {
     // 不删会怎样：下次事件进来 find("\r\n\r\n") 又会找到【同一个请求】→ 又回一遍，
     //             排在后面的请求永远轮不到。（判据：keepalive_test 的 [2]）
     // 删完剩下的才是"还没处理的字节"，下一个请求就排在它前面。
-    ctx.inbuf.erase(0, total);
+    ctx.inbuf.erase(0, pr.total);
 
     return true;   // 我处理掉了一个请求（后面还有没有，调用方接着问）
 }
@@ -254,7 +99,14 @@ int main() {
     }
 
     // ---- 步骤 5：listen ----
-    if (listen(server_fd, 3) < 0) {
+    // backlog = 已完成三次握手、等着被 accept 取走的连接队列上限。
+    //
+    // 原来是 3（照 man 手册的示例抄的），实测这就是吞吐天花板：
+    //   100 并发压上来时，队列只有 3 个位置 → 客户端 ConnectTimeout，
+    //   短连接吞吐被压到 ~4.5k req/s，而服务器 CPU 根本没吃满。
+    // SOMAXCONN 是内核允许的最大值（Linux 上通常 4096）——
+    //   man 2 listen 明说：超过上限的值会被【静默截断】成上限。
+    if (listen(server_fd, SOMAXCONN) < 0) {
         perror("listen");
         return 1;
     }

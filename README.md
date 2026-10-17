@@ -76,6 +76,11 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 工具：JMeter 5.6.3（**同机压测，绝对值仅供参考**）
 场景：`GET /` + `Connection: close`（每个请求新建连接）
 
+⚠ 下表用的是 **JMeter 自己 summary 里的吞吐**；而下面 epoll 那张表用的是
+**`tests/analyze.sh` 算的吞吐** —— 两者**分母不同**（同一个 `.jtl`：4935.8/s vs 4499/s）。
+所以**这张表和下面那张不能直接相除**。要对比请看 `notes/stress.md` 第 2 节里
+用同一把尺子重算过的版本。
+
 | 并发 | 请求数 | 吞吐 | 错误 |
 | --- | --- | --- | --- |
 | 1 | 1000 | 1811.6 /s | 0 (0.00%) |
@@ -99,38 +104,29 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 #### epoll 版实测数据（2026-10-04）
 
 被测版本：`epoll.cpp`（单线程事件驱动 + CP6d-2 的 keep-alive）。
-**完整数据（A/B 对照、阶梯、工具坑）见 `notes/stress.md` 第 2 节**，这里只留摘要。
+
+> 📌 **完整数据在 `notes/stress.md` 第 2 节**：逐档对照表 / 收尾观测（连接数 **761**、
+> `TIME_WAIT` **0**）/ 六条结论 / 压测工具自身的三个坑。
+> **这里只留头条** —— 同一张表不写两处，改一处忘另一处早晚不一致。
 
 ```bash
 BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # 关 keep-alive
 BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 keep-alive
 ```
 
-| 场景（同机压测，绝对值仅供参考） | 吞吐 | 失败 |
+| 同机压测，同一把尺子（`analyze.sh`） | 50 并发 | 100 并发 |
 | --- | --- | --- |
-| epoll，50 并发，`Connection: close` | ~3690 /s | 0 |
-| epoll，50 并发，**keep-alive** | **~10073 /s**（2.7×，连接数 10000 → **50**） | 0 |
-| epoll，100 并发，keep-alive | 11947 /s | 0 |
-| epoll，200 并发，keep-alive | 14875 /s | 3 (0.01%) |
-| epoll，400 并发，keep-alive | 17305 /s | 21 (0.03%) |
-| p2（对比），100 并发 | 4935.8 /s | 2 (0.01%) |
-| p2（对比），200 并发 | 7900.5 /s | 38 (0.10%) |
+| epoll + `Connection: close` | 2770 /s（3 错） | 4058 /s（8 错） |
+| epoll + **keep-alive** | **10787 /s**（0 错） | **16556 /s**（0 错） |
+| p2（阻塞版，同日重跑） | 3949 /s（0 错） | 4055 /s（9 错） |
 
-**结论（这部分比数字重要）**
+**一句话结论**：真正的杠杆是 **keep-alive**（50 并发 **3.9×**、100 并发 **4.1×**，且 0 失败）；
+而 **epoll 本身在"每请求一条连接"模式下并不比阻塞版快**（1 并发时反而慢 **37%**）——
+它的收益是"**同时握住很多连接**"，不是"单条处理更快"。
+剩下的墙仍是 `backlog=3`（失败全在爬坡瞬间）→ 下一步调 `listen(fd, backlog)`。
 
-1. **keep-alive 是最大的那个杠杆**：连接数 10000 → 50，吞吐 2.7×。
-   epoll 的收益**不是**"处理请求更快"（p50 一直零点几毫秒），
-   而是"**一个线程同时握住很多连接**"—— 没有这一点，keep-alive 根本无从谈起。
-2. **`建连 p99` 从 1001 ms 掉到 0 ms** —— p2 那道"连不上"的墙消失了
-   （1001 ms = TCP SYN 重传退避，见上一节）。
-3. **墙的根因一直是 `backlog=3`，不是 CPU**：p2 是被"每请求一条连接"撞出来的；
-   keep-alive 把连接数压掉，墙才退远。剩下的失败（200 / 400 并发那几个）
-   **全部发生在爬坡瞬间** → 下一步该调 `listen(fd, backlog)` 与 `net.core.somaxconn`。
-
-> ⚠ **压测工具自己踩过两个坑**（都已在本次修复，详见 `notes/stress.md`）：
-> ① `analyze.sh` 会把 JMeter 多行 `failureMessage` 的续行当成样本
-> → 吞吐列直接变 **0**；② `http_load.jmx` 的 `use_keepalive` 写成 `boolProp` 时
-> `-Jkeepalive=true` **静默失效** → 连跑两轮其实测的是同一个配置。
+⚠ 上面那张 p2 的旧表用的是 **JMeter 自己 summary 的吞吐**，和这张表的 `analyze.sh`
+吞吐**分母不同**（同一个 `.jtl`：4935.8/s vs 4499/s）—— **两张表不能直接相除**。
 
 ## 已知限制（都还没修，正是后面的学习内容）
 
@@ -161,7 +157,8 @@ BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 ke
 │   ├── epoll_notes.md         epoll 专题（三件套 / EAGAIN 四态 / LT vs ET）
 │   ├── pitfalls.md            全部踩坑 CP1~CP6d + 元教训
 │   ├── selfcheck.md           自检 69 题（题 + 答案）
-│   └── stress.md              JMeter 压测数据（p2 + epoll 两批）
+│   ├── stress.md              压测【数字】（p2 + epoll 两批）
+│   └── loadtest_guide.md      压测【方法】（测什么 / 怎么看 / 观察什么）
 └── tests/
     ├── p2_test.py             23 项【协议正确性】对 p2 和 epoll 都跑
     ├── balance_test.py        4 项【资源配平】fd + 账本
@@ -186,7 +183,8 @@ BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # 开 ke
 - **`notes/learning_progress.md`** —— 进度、方法论、已掌握的概念清单
 - **`notes/epoll_notes.md`** —— epoll 技术专题
 - **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
-- **`notes/stress.md`** —— JMeter 压测数据：第 1 节 `p2`（阻塞版）、第 2 节 `epoll`（keep-alive），含压测工具自身的两个坑
+- **`notes/stress.md`** —— JMeter 压测**数字**：第 1 节 `p2`（阻塞版）、第 2 节 `epoll`（keep-alive），含压测工具自身的两个坑
+- **`notes/loadtest_guide.md`** —— 压测**方法**：测什么 / 六种类型 / 七条方法论 / 怎么看 `.jtl` / 同时观察什么
 
 ## 说明
 

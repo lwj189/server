@@ -27,6 +27,10 @@ int main() {
 1 被测版本：p2.cpp（单线程阻塞 + backlog=3）
 2 环境：4核VM，ubuntu，somaxconn=4096，ulimit -n=524288
 3 工具：JMeter 5.6.3（同机压测 → 绝对值仅供参考）
+  ⚠ JMeter 自己只有 1GB 堆（`jmeter.log` 里的 Max memory=1073741824），
+    4 核机器上它和被测服务器抢 CPU —— 并发拉很高时**JMeter 可能先成为瓶颈**。
+  ⚠ 手动跑 JMeter 一定要带 `-j <文件>`，否则它会把 `jmeter.log` 拉在当前目录
+    （load_test.sh 已经带了，日志进 tests/results/）。
 4 场景：GET /，Connection: close（每请求新建连接）
 5 压力测试结果：
 ===== 1 并发 × 1000 次 =====
@@ -52,42 +56,47 @@ summary =  40000 in 00:00:05 = 7900.5/s Avg:    12 Min:     0 Max:  2003 Err:   
 
 ---
 
-2.源码于epoll（事件驱动 + keep-alive，CP6d-2 之后的版本）
+2.源码于epoll（事件驱动 + CP6d-1 EMFILE 暂停 + CP6d-2 keep-alive）
 
-跑法（load_test.sh 现在能切服务器了）：
-BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh
-BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh
+跑法（load_test.sh 能切服务器；三个配置各跑一遍，前缀不同不会互相覆盖）：
+BIN=./epoll SRC=epoll.cpp TAG=e- KEEPALIVE=false ./tests/load_test.sh   # e- = 关 keep-alive
+BIN=./epoll SRC=epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   # k- = 开 keep-alive
+BIN=./p2    SRC=p2.cpp    TAG=p-                 ./tests/load_test.sh   # p- = p2 同日重跑
 
-压力测试结果（50 并发 × 200 次，各跑 3 次）：
-===== keepalive=false（Connection: close）=====
-3530 / 3771 / 3769 /s     请求 10000 / 连接 10000     TIME_WAIT +166 ~ +700
-===== keepalive=true（Connection: keep-alive）=====
-10142 / 10616 / 9461 /s   请求 10000 / 连接 50        TIME_WAIT 反而在减少
+⚠ 所有数字的原始 .jtl 都在 tests/results/ 里，看前缀就知道是哪个配置。
+   下面的数字【全部用 analyze.sh 同一把尺子】算出来（原因见文末"两把尺子"）。
 
-keepalive=true 的阶梯：
-===== 100 并发 × 200 次 =====
-11947 /s   Err  0 (0.00%)   Avg  4.6ms   p99 20ms   建连p99 0ms
-===== 200 并发 × 200 次 =====
-14875 /s   Err  3 (0.01%)   Avg  8.3ms   p99 30ms   建连p99 0ms
-===== 400 并发 × 200 次 =====
-17305 /s   Err 21 (0.03%)   Avg 14.5ms   p99 52ms   建连p99 0ms
-（三个档位总共只开了 700 条连接 —— 每个线程 1 条，完美复用）
+压力测试结果（同机压测 → 绝对值仅供参考；每格 = 吞吐/s）：
 
-对比 p2（同为 100 / 200 并发）：
-并发 100：p2 4935.8/s（2 错）  → epoll+keepalive 11947/s（0 错）   2.4×
-并发 200：p2 7900.5/s（38 错） → epoll+keepalive 14875/s（3 错）   1.9×，错误少 12×
+并发×次数     e-（close）      k-（keep-alive）     p-（p2 阻塞版）
+1×1000        1280             2915                 2020
+10×200        2200             2278                 2235
+50×200        2770（3 错）      10787（0 错）        3949（0 错）
+100×200       4058（8 错）      16556（0 错）        4055（9 错）
+200×200       —                16045（1 错）        —
+400×200       —                22014（7 错）        —
+
+k- 那一整轮的收尾观测：accept 连接数 = 761（= 1+10+50+100+200+400，每线程 1 条，
+完美复用），TIME_WAIT 残留 = 0。
 
 结论：
-1. keep-alive 是最大的那个杠杆：2.7× 吞吐、1/200 的连接数
-2. 建连 p99 从 1001ms → 0ms = "连不上"那道墙消失的直接证据
-3. 墙的根因一直是 backlog=3，不是 CPU；keep-alive 把连接数压掉之后墙才退远
-   （p2 那道墙是"每请求一条连接" × backlog=3 撞出来的）
-4. 剩下的墙还在 backlog=3：200/400 并发那几个错全发生在【爬坡瞬间】
-   （几百条 SYN 同时到，等位区只有 3 个位置）→ 下一步调 listen(fd, backlog) / somaxconn
-5. epoll 的收益不是"处理更快"（p50 一直零点几毫秒），
-   而是"一个线程同时握住很多连接"—— 没有这点，keep-alive 无从谈起
+1. keep-alive 是最大的那个杠杆：50 并发 2770 → 10787（3.9×）、
+   100 并发 4058 → 16556（4.1×），而且 50/100 两档【0 失败】
+2. ★ epoll 本身（close 模式）并不比阻塞版 p2 快 —— 1 并发时反而慢 37%
+   （1280 vs 2020）。差的正是 epoll 每条连接多出来的开销：
+   fcntl×2 + epoll_ctl + 一次额外的 epoll_wait 往返。
+   → epoll 的收益是"**同时握住很多连接**"，不是"单条处理更快"。
+     没有 keep-alive 的话，epoll 在这个场景里是**负收益**。
+3. 建连 p99：close 模式 1006ms（= SYN 重传退避）→ keep-alive 0ms。
+   这是"连不上"那道墙消失的直接证据。
+4. TIME_WAIT 13131 → 0；连接数 33000 → 761。
+5. 墙的根因一直是 backlog=3，不是 CPU。keep-alive 把连接数压掉之后墙才退远
+   （p2 那道墙是"每请求一条连接" × backlog=3 撞出来的）。
+6. 剩下的墙还在 backlog=3：200/400 并发那几个错全发生在【爬坡瞬间】
+   （几百条 SYN 同时到，等位区只有 3 个位置）
+   → 下一步：调 listen(fd, backlog) 与 net.core.somaxconn
 
-压测工具自己踩的两个坑（都已修，别再踩）：
+压测工具自己踩的三个坑（都已修，别再踩）：
 1. analyze.sh：JMeter 的 failureMessage 里【带换行】→ 续行被当成新样本
    → $1+0=0 把 min 拉到 0 → 耗时算成 1.79e9 秒、吞吐列变 0、样本数 10019≠10000
    修法：4 处加 $1 ~ /^[0-9]+$/ 守卫
@@ -96,7 +105,15 @@ keepalive=true 的阶梯：
      吞吐却差了 60% —— 差点被当成"keep-alive 有效"
    修法：改成 stringProp（实测：2000 请求 2000 条连接 → 10 条连接）
    验证方法：直接看服务器收到的请求头是 keep-alive 还是 close
+   ⚠ 这次事故还留下 4 个**名不副实**的 ek-*.jtl（标着 keepalive=true，实际是
+     close）—— 已删除。留着的话以后会拿它"证明"错误结论。
+3. ★ 两把尺子：**JMeter 自己的 summary 吞吐 ≠ analyze.sh 算的吞吐**（分母不同）。
+   实测同一个 L2_100x200.jtl：JMeter 报 4935.8/s，analyze.sh 算 4499/s。
+   两者都不是"错"的，但**混着比就没意义**。
+   → 本项目所有对比一律用 analyze.sh 的数字（README 里 p2 那张旧表用的是
+     JMeter summary，所以它和 epoll 的表**不能直接相除**）。
 
 未验证的猜想（留着以后验）：epoll.cpp 每个请求写 5 行日志到 stdout，
-而 std::endl 会 flush —— 同步阻塞 IO，可能正压着吞吐上限。
+而 std::endl 会 flush —— 同步阻塞 IO，可能正压着吞吐上限
+（尤其 srv.log 重定向到文件时，实测跑到 400 并发单文件能到 20MB+）。
 要验证就造一个"关掉日志"的变体对比。

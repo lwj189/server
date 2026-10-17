@@ -271,7 +271,7 @@ HANDOFF §7 原来的验收是"3 个 nc 都不关、该打印 fd 5/6/7"。
 
 → **验收标准本身也要被验证：要问"反例能不能通过"。**
 
-**还没做的**（CP6d）：部分写（`EMFILE` 忙等**已完成**，见 §五）。
+**还没做的**（CP6d）：部分写（`EMFILE` 忙等**已完成**，见 §一 的 CP6d-1）。
 
 > 📌 原本这里还列了一项"**同批陈旧事件**"，**实测证明在本设计里不存在**：
 > 单线程 LT + 不 `dup()` → 30000 条连接 / 65240 个事件，陈旧事件 **0** 个。
@@ -280,6 +280,42 @@ HANDOFF §7 原来的验收是"3 个 nc 都不关、该打印 fd 5/6/7"。
 > `man 7 epoll` 里那段警告针对的是 **`dup` 出来的 fd**（同一个 open file description
 > 还有别的 fd 指着，close 一个不会摘除登记）—— 我们没 `dup`。
 > 教训同上：**断言也要验证**。
+
+### ✅ CP6c-1：引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**）
+
+- 额外踩到：多了**第二本账**（账本条目）。漏 `erase` 时编译零警告、测试全绿
+  → 加了**哨兵**，而且必须在 `emplace` 那边（放 `erase` 那边永远喊不出来）
+
+### ✅ CP6c-2：把 CP5 的**状态机搬进来**（`inbuf` + 解析），回真正的 HTTP 响应
+
+- 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
+- 做法：`ClientContext` 加 `std::string inbuf`；三段纯函数（`toLowerAscii`/`findHeader`/
+  `isAllDigits`）从 `p2.cpp` **原样搬**（纯函数搬家不要钱，代码逐字节相同）；
+  新增 `tryHandleRequest(ctx)` —— p2 那边是 `while` 堵着读到收全，这边是**不够就 return，等下次**
+- 5 个空：`"\r\n\r\n"` / `std::string::npos` / `true`（头超限判死刑）/ `header_end + 4 + content_len` / `false`
+- 验收：`tests/p2_test.py` 的 **23 项**对着 `./epoll` **全部通过**（搬迁前实测 **0/23**）
+- ⚠ 踩到的：`total` 只写 `header_end + 4`（漏了 `+ content_len`）→ 编译器警告
+  `content_len set but not used`，测试 **17/23**、6 个失败全是"**提前响应**"
+- 副产物：`tests/balance_test.py`（原 `cp6b_test.py`）—— 见 `pitfalls.md` 的「元教训」节
+
+### ✅ CP6d-1：`EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下空转烧 CPU
+
+- 实测坏版本：**2 秒新增 1,098,114 行日志**、CPU 75%、**连已经连上的用户都超时**
+- 做法：撞墙时 `EPOLL_CTL_DEL` 把 `server_fd` 从 epoll **摘掉**（不再收它的事件），
+  等 `clients.size() < paused_at`（有连接释放、fd 腾出来了）再 `EPOLL_CTL_ADD` 加回去
+- 三个关键点：① `errno == EMFILE`（**per-process**，不是 `ENFILE` 整机）
+  ② 恢复判断必须放在 `epoll_wait` **之前**（否则同一轮里 暂停→恢复→再暂停，还是死循环）
+  ③ `paused_at` 记"暂停那一刻的账本大小" —— **契约和恢复判据是一对，改一个另一个就废**
+- 验收：`tests/emfile_test.py` **2/2**（坏版本新增 109 万行 → 好版本 **新增 0 行**）
+
+### ✅ CP6d-2：keep-alive —— 一条连接服务多个请求
+
+- 为什么值得做：打开一个网页 = 14 个请求。实测发 200 个请求留下
+  **402 个 TIME_WAIT**（每个请求 2 个、各占 60 秒）；keep-alive 只要 2 个
+- 做法：`ClientContext` 加 `bool want_close`；处理完一个请求后
+  **`ctx.inbuf.erase(0, total)`** 消费掉已处理的字节（不删会把同一个请求回两遍）；
+  读 `Connection` 头决定关不关；调用处 `while (tryHandleRequest(ctx))` **循环解析**
+- 验收：`tests/keepalive_test.py` **7/7**（分两次发 / 粘包一次发 / `Connection: close` 回归）
 
 ---
 
@@ -634,77 +670,21 @@ g++ -std=c++17 /tmp/t.cpp -o /tmp/t && /tmp/t
 
 ## 四、亲手撞过的坑 → 见 `pitfalls.md`
 
-已整理成 22 条，分五类，每条都有"现象（报错原文）→ 根因 → 解决 → 验证"：
+全部坑（**CP1 ~ CP6d**）都在 `notes/pitfalls.md`，结构是：
 
-| 分类 | 编号 | 主题 |
-| --- | --- | --- |
-| A. 手册与资料查询 | A1~A6 | 把 man 当代码抄 / `man -k` 筛选 / 找不到 RETURN VALUE / 看不懂 ERRORS / `htons` 在哪页 / 参数名当索引 |
-| B. 语法与 API | B1~B3 | `bool reuse` 导致 EINVAL / `pause("system")` / 块作用域 |
-| C. 编译与工作流 | C1~C5 | 没重新编译 / 没保存 / 文件路径 / 输出缓冲 / `using namespace std` |
-| D. 运行期与系统行为 | D1~D7 | EADDRINUSE 两种成因 / Ctrl+Z / "没输出"其实在运行 / **半包** / **阻塞 read** / **SIGPIPE** / fd 复用 |
-| E. 逻辑与设计 | E1 | 没请求也回响应 |
-
-`pitfalls.md` 里还有：**症状速查表**（看到报错直接查编号）、**常用命令小抄**、**SIGPIPE 专题**。
-
-**CP5 / CP6 阶段新撞的、还没归档的坑**（下次更新 `pitfalls.md` 时补进去）：
-
-| # | 现象 | 根因 |
-| --- | --- | --- |
-| E2 | `'response' was not declared in this scope` | 把声明挪进 `if` 块，但 `send` 还留在块外 → **作用域** |
-| E3 | `expected '}' at end of input` | 改动时括号层级错乱（`if (header_done)` 的 `}` 用掉了 main 的） |
-| D8 | 请求头收全了就以为"请求收全了" | **头部完整 ≠ 请求完整**，还要按 `Content-Length` 收 body |
-| D9 | 发 10MB 垃圾 → 服务器 RSS 从 4MB 涨到 14MB | 没有 `MAX_HEADER_SIZE`，`read_buffer` 无限增长 |
-| D10 | `Content-Length: abc` 让整个进程消失 | `std::stoul` 抛异常没人 catch → `std::terminate` |
-| D11 | 两个请求一次发，只回了一个响应 | **粘包**：`\r\n\r\n` 只匹配到第一个请求，多余的被 `close` 丢弃 |
-| E4 | `else { perror("read"); }` 打印 `read: Success` | 隔了逻辑分支再 `perror` → 打印**过期的 errno** |
-| E5 | body 上限复用了 `MAX_HEADER_SIZE` | 头/体是两个约束，共用一个常量会误杀合法请求（8KB body 太小）|
-| E6 | 小写 `content-length` 不被识别 | `find("Content-Length: ")` **大小写敏感**；RFC 9110 §5.1 规定头字段名不敏感 |
-| E7 | `Content-Length:5`（冒号后无空格）不被识别 | 冒号后的 OWS 可为 0 个（RFC 9112 §5），写死一个空格就会漏 |
-| E8 | `Content-Length: 10abc` 被当成 10 接受 | `stoul` 遇非数字就停 → 要先用 `isAllDigits` 卡纯数字 |
-| B4 | `int fcntl(fd, F_SETFL, ...)` 编译报错 | 那是**声明变量**的语法，不是调用函数 |
-| B5 | 事件循环整段不执行（死代码）| `if (epoll_ctl(...) < 0) { ... }` **少一个 `}`**，把后面全关进了错误分支 |
-
----
+| 部分 | 装什么 |
+| --- | --- |
+| **症状速查** | 最前面 —— 看到报错直接查编号 |
+| **A ~ E 节** | CP1~CP4 的 22 条详细条目（现象 → 根因 → 解决 → **验证**） |
+| **F 节** | CP5 ~ CP6d 新增的（HTTP 解析 / epoll / keep-alive / EMFILE） |
+| **元教训** | 比单个坑更值钱的：两个轴 / 假绿 / 假红 |
+| **附录一 / 二** | 常用命令小抄 / SIGPIPE 专题 |
 
 ## 五、接下来做什么
 
-- [x] **CP5a**：半包（按连接读缓冲区）+ 请求头大小上限
-- [x] **CP5b**：按 `Content-Length` 收全 body + body 大小上限
-- [x] **小修**：body 上限拆成独立的 `MAX_BODY_SIZE`（1MB，与 nginx `client_max_body_size` 默认值一致）
-- [x] **修 3 个解析问题**：头字段名大小写（RFC 9110 §5.1）/ 冒号后 OWS（RFC 9112 §5）/ 非法值 `10abc`（回归用例 t11~t13）
-- [x] **CP6a**：`epoll` 事件循环 + 非阻塞 `server_fd` + `accept` 循环到 `EAGAIN`（`epoll.cpp`，提交 `e468ac9`）
-- [x] **CP6b**：把 **client fd 纳入 epoll**
-      · 做法：`conn_fd` 设非阻塞 → `EPOLL_CTL_ADD` → 用 `events[i].data.fd` 区分总机/分机
-      · 验收：`tests/cp6b_test.py` **4/4 全绿**（echo / 分多次到达 / 并发不串台 / **fd 配平**）
-      · ⚠ 旧的"同时开 3 个 `nc` 不关、该打印 fd 5/6/7"判据是**假绿**，已废 —— 泄漏版照样通过
-- [x] **CP6c-1**：引入 `ClientContext` + `unordered_map<int, ClientContext>` 账本（**行为不变**）
-      · 额外踩到：多了**第二本账**（账本条目）。漏 `erase` 时编译零警告、测试全绿
-        → 加了**哨兵**，而且必须在 `emplace` 那边（放 `erase` 那边永远喊不出来）
-- [x] **CP6c-2**：把 CP5 的**状态机搬进来**（`inbuf` + 解析），回真正的 HTTP 响应
-      · 核心问题：`read_buffer` 该放哪？——"下一次事件"是**另一次函数调用**，局部变量活不到那时
-      · 做法：`ClientContext` 加 `std::string inbuf`；三段纯函数（`toLowerAscii`/`findHeader`/
-        `isAllDigits`）从 `p2.cpp` **原样搬**（纯函数搬家不要钱，代码逐字节相同）；
-        新增 `tryHandleRequest(ctx)` —— p2 那边是 `while` 堵着读到收全，这边是**不够就 return，等下次**
-      · 5 个空：`"\r\n\r\n"` / `std::string::npos` / `true`（头超限判死刑）/ `header_end + 4 + content_len` / `false`
-      · 验收：`tests/p2_test.py` 的 **23 项**对着 `./epoll` **全部通过**（搬迁前实测 **0/23**）
-      · ⚠ 踩到的：`total` 只写 `header_end + 4`（漏了 `+ content_len`）→ 编译器警告
-        `content_len set but not used`，测试 **17/23**、6 个失败全是"**提前响应**"
-      · 副产物：`tests/balance_test.py`（原 `cp6b_test.py`）—— 见下面「两个轴」一节
-- [x] **CP6d-1**：`EMFILE` 忙等 —— `accept` 返回 `EMFILE` 后 LT 模式下空转烧 CPU
-      · 实测坏版本：**2 秒新增 1,098,114 行日志**、CPU 75%、**连已经连上的用户都超时**
-      · 做法：撞墙时 `EPOLL_CTL_DEL` 把 `server_fd` 从 epoll **摘掉**（不再收它的事件），
-        等 `clients.size() < paused_at`（有连接释放、fd 腾出来了）再 `EPOLL_CTL_ADD` 加回去
-      · 三个关键点：① `errno == EMFILE`（**per-process**，不是 `ENFILE` 整机）
-        ② 恢复判断必须放在 `epoll_wait` **之前**（否则同一轮里 暂停→恢复→再暂停，还是死循环）
-        ③ `paused_at` 记"暂停那一刻的账本大小" —— **契约和恢复判据是一对，改一个另一个就废**
-      · 验收：`tests/emfile_test.py` **2/2**（坏版本新增 109 万行 → 好版本 **新增 0 行**）
-- [x] **CP6d-2**：keep-alive —— 一条连接服务多个请求
-      · 为什么值得做：打开一个网页 = 14 个请求。实测发 200 个请求留下
-        **402 个 TIME_WAIT**（每个请求 2 个、各占 60 秒）；keep-alive 只要 2 个
-      · 做法：`ClientContext` 加 `bool want_close`；处理完一个请求后
-        **`ctx.inbuf.erase(0, total)`** 消费掉已处理的字节（不删会把同一个请求回两遍）；
-        读 `Connection` 头决定关不关；调用处 `while (tryHandleRequest(ctx))` **循环解析**
-      · 验收：`tests/keepalive_test.py` **7/7**（分两次发 / 粘包一次发 / `Connection: close` 回归）
+- [ ] **C++ 靶场：请求行解析**（进行中）—— `request_line.cpp` + `tests/parse_test.py`
+      · 靶子：`GET /a?b=1 HTTP/1.1` → 拆成 method / target / version
+      · 顺手解锁：① `keepalive_test` 不用再读日志 ② 响应可大可小 → **部分写变得可测**
 - [ ] **CP6d-3**：部分写 —— `send` 返回 < n 时要有输出缓冲 + `EPOLLOUT`（**等响应变大再做**）
       · ⚠ 现在**撞不到**：一次响应 117 字节 ≪ 发送缓冲区 16384 字节
       · 按 TDD 规矩"**写不出会红的测试就别改代码**" → 等响应变大 / 长连接压测时再回来

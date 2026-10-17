@@ -65,6 +65,15 @@
 | keep-alive 下 `inbuf` 不消费 | 处理完不 `erase` → 下次事件 `find("\r\n\r\n")` 又找到**同一个请求** → 回两遍，排在后面的请求永远轮不到（`[2]` 抓） |
 | keep-alive 的测试用两个**一模一样**的请求 | **假绿**：服务器把第一个请求回了两遍、压根没看第二个，照样全绿 → 改成 `/first` + `/second` 两个不同路径，并**读服务器日志**确认两个都真被处理 |
 | 在 `/tmp` 里编译好、下一条命令就没了 | `/tmp` **跨命令会被清掉** → 报 `Connection refused` 之类莫名其妙的错。要跨命令用的东西放项目目录里 |
+| E2 | `'response' was not declared in this scope` | 把声明挪进 `if` 块，但 `send` 还留在块外 → **作用域** |
+| E3 | `expected '}' at end of input` | 改动时括号层级错乱（`if (header_done)` 的 `}` 用掉了 main 的） |
+| D8 | 请求头收全了就以为"请求收全了" | **头部完整 ≠ 请求完整**，还要按 `Content-Length` 收 body |
+| D9 | 发 10MB 垃圾 → 服务器 RSS 从 4MB 涨到 14MB | 没有 `MAX_HEADER_SIZE`，`read_buffer` 无限增长 |
+| D10 | `Content-Length: abc` 让整个进程消失 | `std::stoul` 抛异常没人 catch → `std::terminate` |
+| D11 | 两个请求一次发，只回了一个响应 | **粘包**：`\r\n\r\n` 只匹配到第一个请求，多余的被 `close` 丢弃 |
+| E4 | `else { perror("read"); }` 打印 `read: Success` | 隔了逻辑分支再 `perror` → 打印**过期的 errno** |
+| E5 | body 上限复用了 `MAX_HEADER_SIZE` | 头/体是两个约束，共用一个常量会误杀合法请求（8KB body 太小）|
+| E7 | `Content-Length:5`（冒号后无空格）不被识别 | 冒号后的 OWS 可为 0 个（RFC 9112 §5），写死一个空格就会漏 |
 
 ---
 

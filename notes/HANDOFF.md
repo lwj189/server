@@ -106,11 +106,12 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 │                              （23 + 23 + 4 串行；keepalive 7 + emfile 2 自起服务器）
 ├── notes/
 │   ├── HANDOFF.md          ← 本文件（给新对话的第一份）
-│   ├── learning_progress.md ← 进度：各 CP 小节 + 方法论 12 条 + 概念清单
+│   ├── learning_progress.md ← 进度：各 CP 小节 + 方法论 15 条 + 概念清单
 │   ├── epoll_notes.md      ← epoll 专题：API + 概念 + 坑 + 速查表（CP6a ~ CP6d）
 │   ├── pitfalls.md         ← 【全部踩坑】CP1~CP6d + 元教训（心得）。坑只有这一个家
 │   ├── selfcheck.md        ← 自检 69 题【题 + 答案】（先自己答，再往下翻）
-│   └── stress.md           ← JMeter 压测数据：p2（阻塞版）+ epoll（keep-alive）两批 + 工具坑
+│   ├── stress.md           ← 压测【数字】：p2（阻塞）+ epoll（keep-alive）两批
+│   └── loadtest_guide.md   ← 压测【方法】：测什么 / 怎么设计 / 怎么看 / 观察什么
 └── tests/
     ├── p2_test.py         ← 【正确性】23 项：正常/连上就关/RST/并发/半包/超长头/body 分片…
     ├── balance_test.py    ← 【配平】4 项：fd + 账本两本账（原 cp6b_test.py，见文件头注释）

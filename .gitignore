@@ -4,6 +4,7 @@ desktop.ini
 # 编译产物
 thread
 thread_pool
+lib_server
 *.o
 *.out
 *.exe

@@ -25,7 +25,7 @@ constexpr size_t MAX_BODY_SIZE = 1024 * 1024;
 // ---------------------------------------------------------------------------
 // HTTP 头字段解析工具
 //
-// 为什么单独抽成三个函数：CP5 解析 Content-Length 时踩了三个坑，它们正好一一对应——
+// 为什么单独抽成三个函数：解析 Content-Length 有三个容易踩的坑，它们正好一一对应——
 //   · 头字段名大小写敏感      → toLowerAscii + findHeader 里的比较
 //   · 冒号后必须有空格        → findHeader 里跳过 OWS
 //   · stoul 把 "10abc" 当 10  → isAllDigits 先把值卡成纯数字

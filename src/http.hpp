@@ -191,7 +191,7 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
         return out;   // NeedMore：等下次事件
     }
 
-    // ---- ② 解析 Content-Length（CP5 的三个坑由上面两个纯函数解决）----
+    // ---- ② 解析 Content-Length ----
     size_t content_len = 0;   // 没有这个头字段就按 0 处理（普通 GET 就是这种）
     std::string cl_value;
     if (findHeader(ctx.inbuf, header_end, "Content-Length", cl_value)) {

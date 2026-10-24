@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-test:
-    name: 严格编译 + 测试（p2 23 / epoll 23+4 / keepalive 7 / emfile 2）
+    name: 严格编译 4 个服务器 + 测试（p2 23 / epoll 23+4 / thread 23+4 / keepalive 7×2 / emfile 2×2）
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -23,14 +23,19 @@ jobs:
           g++ --version | head -1
           python3 --version
 
-      # 两个源文件都要"零警告"，否则算失败（和本地同一条命令）
-      - name: 严格编译 p2.cpp 和 epoll.cpp（有警告就算失败）
+      # 四个源文件都要"零警告"，否则算失败（和本地同一条命令）
+      #   thread / p2_lib 用了线程池 → 多一个 -pthread
+      #   p2_lib 必须 -Ithird_party/cpp-httplib（它 #include "httplib.h"）
+      # 注意 $EXTRA 故意不加引号：空串要在命令行上"消失"，否则 g++ 会把空参数当成文件名
+      - name: 严格编译四个服务器（有警告就算失败）
         run: |
           FAIL=0
           mkdir -p build
-          for src in p2 epoll; do
+          for src in p2 epoll thread p2_lib; do
+            EXTRA=""
+            case "$src" in thread|p2_lib) EXTRA="-pthread" ;; esac
             echo "================ 编译 src/$src.cpp ================"
-            if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion "src/$src.cpp" -o "build/$src" 2> build.log; then
+            if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -Isrc -Ithird_party/cpp-httplib "src/$src.cpp" -o "build/$src" $EXTRA 2> build.log; then
               echo "::error::src/$src.cpp 编译失败"
               cat build.log
               FAIL=1
@@ -46,14 +51,18 @@ jobs:
           done
           exit $FAIL
 
-      # ⚠ p2 和 epoll 都监听 8888，所以只能【串行】：
+      # ⚠ p2 / epoll / thread 都监听 8888，所以只能【串行】：
       #   起一个 → 等 LISTEN → 跑测试 → 杀掉 → 等端口释放 → 再起下一个
       # 一个失败不影响另一个继续跑（最后统一看 RC），这样一次 CI 能同时看到全部结果
       #
       # 两套测试的分工（正交，都要绿）：
-      #   p2_test.py      【协议正确性】回答对不对 —— 对 p2 和 epoll 都跑
-      #   balance_test.py 【资源配平】东西有没有还回去（fd + 账本）—— 只对 epoll 跑
-      - name: 跑测试（p2 23 项 / epoll 23 项 + 配平 4 项）
+      #   p2_test.py      【协议正确性】回答对不对 —— p2 / epoll / thread 都跑
+      #   balance_test.py 【资源配平】东西有没有还回去（fd + 账本）—— epoll / thread 跑
+      #
+      # p2_lib 故意【不跑】p2_test：它是 cpp-httplib 对照组，预期 21/23
+      # （t7 超长请求头 / t10 超大 body 它既不拒绝也不断开 —— 库里根本没有这两个上限）。
+      # 那 2 项是【对照结论】不是 bug，塞进流水线只会让它永远红；所以它只做上面的零警告编译。
+      - name: 跑测试（p2 23 项 / epoll 23+4 项 / thread 23+4 项）
         run: |
           RC=0
 
@@ -112,6 +121,7 @@ jobs:
 
           run_one build/p2    tests/p2_test.py
           run_one build/epoll tests/p2_test.py tests/balance_test.py
+          run_one build/thread tests/p2_test.py tests/balance_test.py
 
           exit $RC
 
@@ -119,11 +129,15 @@ jobs:
       # emfile 要先把 ulimit -n 压低再启动），所以必须等上面的服务器都杀掉之后再跑。
       # 它们启动前会检查 8888 是否空闲 —— 被占用就直接退出码 2，这才是对的：
       # 宁可报"环境不对"，也不能连到别人的服务器上跑出一片假绿。
-      - name: 跑"自己起服务器"的两套（keepalive 7 项 + emfile 2 项）
+      # 只对 epoll / thread 跑：p2 是阻塞串行版，本来就不支持 keep-alive（预期 3/7）。
+      # keepalive 7 项验收的是"多请求复用一条连接"这一层，不是 p2 的能力范围。
+      - name: 跑"自己起服务器"的两套（keepalive 7×2 + emfile 2×2：epoll / thread）
         run: |
           RC=0
-          echo "-------- tests/keepalive_test.py --------"
-          python3 tests/keepalive_test.py || RC=1
-          echo "-------- tests/emfile_test.py --------"
-          python3 tests/emfile_test.py || RC=1
+          for bin in epoll thread; do
+            echo "-------- tests/keepalive_test.py --bin build/$bin --------"
+            python3 tests/keepalive_test.py --bin "build/$bin" || RC=1
+            echo "-------- tests/emfile_test.py --bin build/$bin --------"
+            python3 tests/emfile_test.py --bin "build/$bin" || RC=1
+          done
           exit $RC

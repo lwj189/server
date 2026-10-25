@@ -29,6 +29,5 @@ jmeter.log
 # 压测产物（.jtl 每个几百 KB ~ 几 MB，跑几次就上百 MB）
 tests/results/
 
-# 分支交接（工作文档，不推 GitHub —— 里面是给下一个对话看的上下文）
-notes/BRANCH_HANDOFF.md
-notes/CONVERSATION.md
+# AI 交接文档（工作文档，不推 GitHub —— 里面是给下一个对话看的上下文）
+notes/AI_HANDOFF.md

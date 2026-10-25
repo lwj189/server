@@ -181,7 +181,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 │   └── cpp-httplib/
 │       └── httplib.h           第三方单头文件（23,368 行，vendored 进仓库）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
-├── notes/                      ← 笔记（8 份入库，另有 2 份交接文档不入库）
+├── notes/                      ← 笔记（8 份入库，另有 1 份 AI 交接文档不入库）
 ├── tests/                      ← 测试（4 套 Python + 压测驱动）
 ├── .github/workflows/ci.yml    CI：严格编译 + 跑 4 套测试
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）

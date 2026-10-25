@@ -15,7 +15,7 @@ CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 → CP5 半包/粘包 ✅ → CP6a~d epoll / EMFILE / keep-alive ✅ → 线程池 ✅
 ```
 
-`src/` 下是五种实现，跑同一套测试：
+`src/` 下是五个可执行目标 —— 四个服务器跑同一套测试，外加一个线程池演示：
 
 | 文件 | 并发模型 | 真实代码行 |
 | --- | --- | --- |
@@ -181,7 +181,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 │   └── cpp-httplib/
 │       └── httplib.h           第三方单头文件（23,368 行，vendored 进仓库）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
-├── notes/                      ← 笔记（7 份，见下）
+├── notes/                      ← 笔记（8 份入库，另有 2 份交接文档不入库）
 ├── tests/                      ← 测试（4 套 Python + 压测驱动）
 ├── .github/workflows/ci.yml    CI：严格编译 + 跑 4 套测试
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）

@@ -23,17 +23,18 @@ jobs:
           g++ --version | head -1
           python3 --version
 
-      # 四个源文件都要"零警告"，否则算失败（和本地同一条命令）
-      #   thread / p2_lib 用了线程池 → 多一个 -pthread
+      # 五个源文件都要"零警告"，否则算失败（和本地同一条命令）
+      #   thread / p2_lib / thread_pool 都要 -pthread
       #   p2_lib 必须 -Ithird_party/cpp-httplib（它 #include "httplib.h"）
+      #   thread_pool.cpp 只是演示，也要编得过——不进 CI 的文件会悄悄腐烂
       # 注意 $EXTRA 故意不加引号：空串要在命令行上"消失"，否则 g++ 会把空参数当成文件名
-      - name: 严格编译四个服务器（有警告就算失败）
+      - name: 严格编译五个目标（有警告就算失败）
         run: |
           FAIL=0
           mkdir -p build
-          for src in p2 epoll thread p2_lib; do
+          for src in p2 epoll thread p2_lib thread_pool; do
             EXTRA=""
-            case "$src" in thread|p2_lib) EXTRA="-pthread" ;; esac
+            case "$src" in thread|p2_lib|thread_pool) EXTRA="-pthread" ;; esac
             echo "================ 编译 src/$src.cpp ================"
             if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -Isrc -Ithird_party/cpp-httplib "src/$src.cpp" -o "build/$src" $EXTRA 2> build.log; then
               echo "::error::src/$src.cpp 编译失败"

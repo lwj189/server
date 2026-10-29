@@ -31,9 +31,9 @@
 
 #include "httplib.h"   // 单头文件：把它拖到项目目录就能用，零依赖
 
-#include <cstdlib>     // std::atoi
-#include <iostream>    // std::cout / std::endl
-#include <string>      // std::string
+#include <cstdlib>    // std::atoi
+#include <iostream>   // std::cout / std::endl
+#include <string>     // std::string
 
 // 和另外三个版本返回完全一样的内容 —— 这样 p2_test.py 的 23 项才有可比性
 // （如果这里随便写，测试红了一片，就分不清是"库不行"还是"我写的不一样"）

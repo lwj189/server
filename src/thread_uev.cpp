@@ -71,13 +71,17 @@
 // 【和 src/thread.cpp 的差异】（都是有意改的，不是两份代码在漂移）
 //   1. 信号 → signalfd，和 listen fd / 连接 fd 一起进 epoll（本文件新增）
 //   2. 优雅停机：drain 线程池 + 关空闲连接（thread.cpp 收到 SIGTERM 直接死）
-//   3. /work 精确匹配路径（thread.cpp 用 rfind("/work",0)，/worker 会被当成 /work）
-//   4. workUnits 按 & 切参数、参数名必须恰为 n（thread.cpp 用 find("n=")，
-//      "?foo=n=5" 这种会被误判成 n=5）
-//   5. send 做 EINTR 重试 + 全量校验；发失败/只发一半就收连接
-//      （thread.cpp 只 perror，然后把半条响应留在连接上继续复用）
-//   6. epoll_ctl ADD back 失败时收连接（thread.cpp 只 perror → fd 和账本双泄漏）
-//   7. --workers / --port 严格解析（thread.cpp 用 stoul，非法值会抛异常崩在 main）
+//   3. 结构：本文件把 src/http.hpp、src/thread_pool.hpp 合了进来（自包含，
+//      单个文件就能编；thread.cpp 仍然是 3 个文件一起编）
+//
+//   ⚠ 这份清单原来还列着 5 条（/work 前缀匹配、workUnits 的 find("n=")、
+//     send 只 perror、ADD back 只 perror、stoul 崩）—— 那 5 项描述的是
+//     【未加固版】thread.cpp。它们后来都在 thread.cpp 里逐条修掉了：
+//       · pathOf / workUnits 切参数      src/thread.cpp:119 / :129
+//       · send 失败与部分写收连接        src/thread.cpp:233
+//       · EPOLL_CTL_ADD back 失败收连接  src/thread.cpp:275（:316 处）
+//       · parseUnsigned 严格解析参数     src/thread.cpp:369
+//     所以现在只剩上面 1~3 条是真差异，别的都是两边一样的。
 //
 // 编译运行（-pthread 必须加）：
 //   g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -pthread src/thread_uev.cpp -o build/thread_uev
@@ -573,7 +577,7 @@ static void dropClient(int fd) {
 // ⚠ 没有输出缓冲 + EPOLLOUT，所以"发不完"不能等 —— 只能判定这条连接坏了。
 //   小响应（几十字节）不会撞到，但代码不能假设 send 一定一次发完：
 //   非阻塞 fd 上 send 可能返回部分写入（EAGAIN），剩下的字节必须有人保管，
-//   而这里没有保管的地方（thread.cpp 的已知妥协，见 notes/BRANCH 讨论）。
+//   而这里没有保管的地方（thread.cpp 是同样的取舍：部分写就收掉连接）。
 //   所以：要么一次发完，要么收掉连接 —— 绝不留半条响应在连接上继续复用。
 // ===========================================================================
 static bool sendAll(int fd, const std::string& data) {

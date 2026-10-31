@@ -1,9 +1,9 @@
 // ===========================================================================
-// src/epoll.cpp：单线程 Reactor 版 HTTP 服务器
+// epoll.cpp：单线程 Reactor 版 HTTP 服务器（基线实现）
 //
-// 并发模型：一个线程 + 一个 epoll 实例照看所有连接。
-// HTTP 的解析 / 拼响应 / 每条连接的状态都在 src/http.hpp 里 ——
-// 那部分和并发模型无关，所以和 src/thread.cpp（线程池版）共用一份。
+// HTTP 的解析 / 拼响应 / 每条连接的状态，全部在 http.hpp 里 ——
+// 那部分和"用什么并发模型"无关，所以和 thread.cpp（线程池版）共用一份。
+// 本文件只负责【并发模型】：一个线程 + 一个 epoll 实例照看所有连接。
 // ===========================================================================
 #include "http.hpp"        // ClientContext / parseRequest / buildResponse / logLine
 
@@ -23,11 +23,13 @@
 
 constexpr uint16_t PORT = 8888;   // 监听端口
 
-// ClientContext（每条连接的状态：fd / inbuf / want_close）定义在 src/http.hpp，
-// 三个纯函数（toLowerAscii / findHeader / isAllDigits）也在那里 —— 线程池版共用。
+// ClientContext（每条连接的状态：fd / inbuf / want_close）已经搬到 http.hpp ——
+// 线程池版也要用它，所以不能只留在这一个文件里。
+
+// 三个纯函数（toLowerAscii / findHeader / isAllDigits）也已经搬到 http.hpp。
 
 // ===========================================================================
-// 处理一个完整请求：解析（借 src/http.hpp）→ 发响应 → 消费掉 inbuf 里的字节
+// 处理一个完整请求：解析（借 http.hpp）→ 发响应 → 消费掉 inbuf 里的字节
 //
 // 返回值：true  = 已经有结果了（响应发了 / 或这条连接该被丢弃）→ 调用方收连接
 //         false = 还不够一个完整请求 → 等下次 EPOLLIN 再进来接着算
@@ -43,7 +45,7 @@ static bool tryHandleRequest(ClientContext& ctx) {
     }
     if (pr.result == ParseResult::Rejected) {
         // 请求非法（头过大 / Content-Length 非法…）：ctx.want_close 已被置 true。
-        // 【什么都不回】，直接让调用方收掉连接。
+        // 【什么都不回】，直接让调用方收掉连接 —— 和 p2.cpp 的行为一致。
         return true;
     }
 
@@ -57,9 +59,10 @@ static bool tryHandleRequest(ClientContext& ctx) {
         perror("send");
     }
 
-    // ---- 把已经处理掉的字节从 inbuf 里删掉 ----
-    // 不删的话，下次事件进来 find("\r\n\r\n") 又会找到同一个请求 → 又回一遍，
-    // 排在后面的请求永远轮不到。删完剩下的才是"还没处理的字节"。
+    // ---- 把【已经处理掉】的字节从 inbuf 里删掉（消费）----
+    // 不删会怎样：下次事件进来 find("\r\n\r\n") 又会找到【同一个请求】→ 又回一遍，
+    //             排在后面的请求永远轮不到。（判据：keepalive_test 的 [2]）
+    // 删完剩下的才是"还没处理的字节"，下一个请求就排在它前面。
     ctx.inbuf.erase(0, pr.total);
 
     return true;   // 我处理掉了一个请求（后面还有没有，调用方接着问）
@@ -97,9 +100,12 @@ int main() {
 
     // ---- 步骤 5：listen ----
     // backlog = 已完成三次握手、等着被 accept 取走的连接队列上限。
-    // 队列太短（比如照 man 手册的示例写 3）会成为吞吐天花板：
-    // 高并发时客户端连 ConnectTimeout，而服务器 CPU 根本没吃满。
-    // SOMAXCONN 是内核允许的最大值（超过上限的值会被静默截断成上限）。
+    //
+    // 原来是 3（照 man 手册的示例抄的），实测这就是吞吐天花板：
+    //   100 并发压上来时，队列只有 3 个位置 → 客户端 ConnectTimeout，
+    //   短连接吞吐被压到 ~4.5k req/s，而服务器 CPU 根本没吃满。
+    // SOMAXCONN 是内核允许的最大值（Linux 上通常 4096）——
+    //   man 2 listen 明说：超过上限的值会被【静默截断】成上限。
     if (listen(server_fd, SOMAXCONN) < 0) {
         perror("listen");
         return 1;
@@ -138,19 +144,21 @@ int main() {
 
     std::cout << "epoll ready, listening on port " << PORT << " ..." << std::endl;
 
-    // ---- 连接账本：fd → 连接状态 ----
-    // 这是"现在到底有哪些连接活着"的唯一真相来源。
+    // ---- CP6c：连接账本 ----
+    // fd → 该连接的状态。这是"现在到底有哪些连接活着"的唯一真相来源。
     //
-    // ⚠ 两本账要配平：
+    // ⚠ 从这里开始有【两本账】要配平：
     //     · fd 号     —— 靠 close() 销账
     //     · 账本条目  —— 靠 erase() 销账
-    //   只 close 不 erase = 内存泄漏；只 erase 不 close = fd 泄漏。
+    //   只 close 不 erase = 内存泄漏；只 erase 不 close = fd 泄漏。两本都得平。
+    //   这就是 HANDOFF §8.3 说的"第二阶段：close / erase 配对"。
     std::unordered_map<int, ClientContext> clients;
 
-    // ---- EMFILE 暂停状态 ----
-    // accept 撞到 EMFILE（本进程 fd 用光）后如果只是 break，
+    // ---- CP6d：EMFILE 暂停状态 ----
+    // 为什么要它：accept 撞到 EMFILE（fd 用光）后如果只是 break，
     // LT 模式下监听 fd 仍然"可读" → epoll_wait 立刻又返回 → 死循环烧 CPU。
-    // 办法：暂停时把 server_fd 从 epoll 里摘掉；等有连接关闭、fd 腾出来，再加回去。
+    // 实测：3 秒刷了 161 万行 "accept: Too many open files"，CPU 100%。
+    // 办法：暂停时把 server_fd 从 epoll 里【摘掉】；等有连接关闭、fd 腾出来，再【加回去】。
     bool accept_paused = false;
     size_t paused_at = 0;   // 暂停那一刻账本里有几条（后面拿它判断"有没有腾出 fd"）
 
@@ -159,9 +167,15 @@ int main() {
     struct epoll_event events[MAX_EVENTS];
 
     while (true) {
-        // ---- 先看看能不能恢复接收 ----
+        // ---- CP6d：先看看能不能恢复接收 ----
         // 判据：暂停时账本有 paused_at 条，现在少了 → 至少腾出了一个 fd。
-        // 这一步必须在 epoll_wait 之前：先问能不能恢复，再决定睡不睡。
+        //
+        // ⚠ 位置：必须在这个 while 循环【里面】。
+        //   实测（造变体验的）：放循环外 → 这段永远不执行 → 摘了话筒再也放不回去 → [2] 报"连不上"。
+        //   放这里 vs 放循环体【末尾】：实测【等价】，两个都 2/2。
+        //   （原来这行注释写的是"放末尾会 暂停→恢复→再暂停 又变死循环" —— 那是个
+        //    没验证过的猜测，已被实测推翻。留在这里只是因为语义更清楚：）
+        // ★ "能不能恢复"是【睡前】要问的问题 —— 先问，再睡。
         if (accept_paused && clients.size() < paused_at) {
             // 加回去。用的还是当初登记 server_fd 时那个 event（它还在作用域里）
             if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == 0) {
@@ -171,7 +185,7 @@ int main() {
         }
 
         // 返回值三态：>0 就绪的 fd 个数 / 0 超时（不是错误）/ -1 出错
-        // timeout = -1：没有事件就一直睡，不占 CPU
+        // timeout = -1：没有事件就一直睡（实测 0% CPU，wchan=ep_poll）
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0) {
             if (errno == EINTR) continue;   // 被信号打断：重试，不是错误
@@ -197,8 +211,11 @@ int main() {
                         if (errno == EMFILE) {   // 本【进程】的 fd 用光了（ENFILE 才是整机）
                             std::cerr << "fd 用光了 —— 暂停接收，等连接释放" << std::endl;
                             // 把它从 epoll 摘掉，别再收它的事件 —— 摘了才不会空转。
-                            // （EPOLL_CTL_DEL 的 event 参数会被内核忽略，传什么都不会读）
-                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, server_fd, &ev);
+                            // event 参数传 nullptr：man 2 epoll_ctl 说 EPOLL_CTL_DEL 时
+                            // 这个参数【会被内核忽略】（Linux 2.6.9 之后允许传 NULL）。
+                            // 这里原来传的是 &ev —— 内容根本没被读过，却像是在说"这个 ev 有用"。
+                            // thread.cpp 里同一条调用写的是 nullptr，两处现在统一了。
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, server_fd, nullptr);
                             accept_paused = true;
                             paused_at = clients.size();   // 记下暂停时的账本大小（恢复判据比它小）
                             break;
@@ -212,9 +229,11 @@ int main() {
                     std::cout << "新连接 fd=" << conn_fd << " 来自 " << ip << ":"
                               << ntohs(client_addr.sin_port) << std::endl;
 
-                    // ---- conn_fd 也要设成非阻塞（同样是读-改-写）----
-                    // 事件循环是一个线程轮流照顾所有连接；如果这条连接的 read 阻塞住，
-                    // 整个线程就停在这一条连接上，其它连接和监听 fd 的事件全都处理不了。
+                    // ---- CP6b ①：conn_fd 也要设成非阻塞 ----
+                    // 和第 53~61 行处理 server_fd 时完全同形（都是"读-改-写"），只是换了 fd。
+                    // 为什么必须非阻塞：事件循环是"一个线程轮流照顾所有连接"。
+                    // 如果这条分机的 read 阻塞住，整个线程就停在这一条连接上，
+                    // 其它分机和总机的事件全都处理不了 —— 那就退化回 CP2 的阻塞版了。
                     int cflags = fcntl(conn_fd, F_GETFL, 0);
                     if (cflags == -1) {
                         perror("fcntl F_GETFL conn");
@@ -227,12 +246,12 @@ int main() {
                         continue;
                     }
 
-                    // ---- 把 conn_fd 登记进 epoll ----
-                    // 登记之后，这条连接上的数据到达时，epoll_wait 才会把它报给我们。
-                    // data.fd 写 conn_fd：事件回来时，就用这个标记分辨"是哪条连接"。
+                    // ---- CP6b ②：把 conn_fd 登记进 epoll ----
+                    // 登记之后，这条分机上的数据到达时，epoll_wait 才会把它报给我们。
+                    // data.fd 写 conn_fd：事件回来时，就用这个标记分辨"是哪条分机"。
                     struct epoll_event cev{};
-                    cev.events = EPOLLIN;    // 关心"可读"：对连接就是"对端发数据来了"
-                    cev.data.fd = conn_fd;   // 标记写 conn_fd：事件回来时靠它认出是哪条连接
+                    cev.events = EPOLLIN;    // 关心"可读"：对分机就是"对端发数据来了"
+                    cev.data.fd = conn_fd;   // 标记写 conn_fd：事件回来时靠它认出是哪条分机
 
                     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &cev) < 0) {
                         perror("epoll_ctl: conn_fd");
@@ -240,11 +259,12 @@ int main() {
                         continue;
                     }
 
-                    // ---- 把这条连接记进账本 ----
+                    // ---- CP6c：把这条连接记进账本 ----
                     // 放在 epoll_ctl 成功【之后】：前面任何一步失败都已经 close + continue 了，
                     // 走到这儿才动手，就不用再回头擦屁股。
                     ClientContext ctx;
                     ctx.fd = conn_fd;
+                    // ---- CP6c：存进账本（这里才是第一道哨兵）----
                     // emplace 返回 pair<iterator, bool>，那个 bool = "到底插进去了没有"。
                     // key 已存在时它【静默不插】—— 而 fd 号会被复用，
                     // 所以 false 就意味着：上一个用这个号码的连接没销账。
@@ -260,7 +280,7 @@ int main() {
                     }
                 }
             } else {
-                // ---- 分机的事件（data.fd != server_fd）----
+                // ---- CP6b ③ / CP6c：分机的事件（data.fd != server_fd）----
                 int fd = events[i].data.fd;
 
                 // ---- 先从账本里把这条连接找出来 ----
@@ -277,12 +297,13 @@ int main() {
 
                 char buf[1024];
                 // 为什么要循环：一次事件只保证"现在有数据可读"，
-                // 不保证"读一次就读完了"。非阻塞 fd 的标准用法就是"一直操作，直到 EAGAIN"。
+                // 不保证"读一次就读完了"。和 CP6a 里 accept 循环到 EAGAIN 是同一个形状 ——
+                // 非阻塞 fd 的标准用法就是"一直操作，直到 EAGAIN 为止"。
                 while (true) {
                     ssize_t n = read(fd, buf, sizeof(buf));
 
                     if (n > 0) {
-                        // ---- 攒进这条连接【自己】的缓冲区 ----
+                        // ---- CP6c-2：攒进这条连接【自己】的缓冲区（不再回显）----
                         // 是 append 不是 = ：一段一段往上接，这就是半包/粘包的落脚点。
                         ctx.inbuf.append(buf, static_cast<size_t>(n));
 
@@ -319,8 +340,9 @@ int main() {
                         //
                         // 为什么要写成 if：erase 返回"删掉了几个"（只能是 0 或 1）。
                         // 返回 0 = 账本里【本来就没有】这条 —— 那必然是别的地方漏销账了。
-                        // 这是【故意加的哨兵】：漏 erase 时 fd 数是平的、测试也看不出来，
-                        // 只有这里会喊出来。
+                        //
+                        // 这是【故意加的哨兵】：漏 erase 时，fd 数是平的、cp6b_test.py
+                        // 4/4 全绿、编译零警告 —— 只有这里会喊出来。
                         if (clients.erase(fd) == 0) {
                             std::cerr << "账本里没有 fd=" << fd << " —— 有地方漏销账" << std::endl;
                         }

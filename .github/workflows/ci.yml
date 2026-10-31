@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-test:
-    name: 严格编译 4 个服务器 + 测试（p2 23 / epoll 23+4 / thread 23+4 / keepalive 7×2 / emfile 2×2）
+    name: 严格编译 7 个目标 + 测试（p2 23 / epoll 23+4 / thread 23+4 / keepalive 7×2 / emfile 2×2）
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -23,18 +23,18 @@ jobs:
           g++ --version | head -1
           python3 --version
 
-      # 五个源文件都要"零警告"，否则算失败（和本地同一条命令）
-      #   thread / p2_lib / thread_pool 都要 -pthread
+      # 七个源文件都要"零警告"，否则算失败（和本地同一条命令）
+      #   thread / thread_uev / p2_lib / thread_pool 都要 -pthread
       #   p2_lib 必须 -Ithird_party/cpp-httplib（它 #include "httplib.h"）
       #   thread_pool.cpp 只是演示，也要编得过——不进 CI 的文件会悄悄腐烂
       # 注意 $EXTRA 故意不加引号：空串要在命令行上"消失"，否则 g++ 会把空参数当成文件名
-      - name: 严格编译五个目标（有警告就算失败）
+      - name: 严格编译七个目标（有警告就算失败）
         run: |
           FAIL=0
           mkdir -p build
-          for src in p2 epoll thread p2_lib thread_pool; do
+          for src in p2 p2_route epoll thread thread_uev p2_lib thread_pool; do
             EXTRA=""
-            case "$src" in thread|p2_lib|thread_pool) EXTRA="-pthread" ;; esac
+            case "$src" in thread|thread_uev|p2_lib|thread_pool) EXTRA="-pthread" ;; esac
             echo "================ 编译 src/$src.cpp ================"
             if ! g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -Isrc -Ithird_party/cpp-httplib "src/$src.cpp" -o "build/$src" $EXTRA 2> build.log; then
               echo "::error::src/$src.cpp 编译失败"
@@ -63,6 +63,12 @@ jobs:
       # p2_lib 故意【不跑】p2_test：它是 cpp-httplib 对照组，预期 21/23
       # （t7 超长请求头 / t10 超大 body 它既不拒绝也不断开 —— 库里根本没有这两个上限）。
       # 那 2 项是【对照结论】不是 bug，塞进流水线只会让它永远红；所以它只做上面的零警告编译。
+      #
+      # 另两个也【只编译不测】：
+      #   p2_route —— 它的路由会把 "/任意路径" 变成 404，而 p2_test 的 23 项断言写的是
+      #               "任何路径都返回 Hello"（那是 p2.cpp 的语义）。要测它得先改断言。
+      #   thread_uev —— thread 的信号处理变体（signalfd + 优雅停机），逻辑同 thread，
+      #               但还没逐项跑过这套测试，先只保证编译不腐烂。
       - name: 跑测试（p2 23 项 / epoll 23+4 项 / thread 23+4 项）
         run: |
           RC=0

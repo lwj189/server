@@ -15,25 +15,29 @@ CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 → CP5 半包/粘包 ✅ → CP6a~d epoll / EMFILE / keep-alive ✅ → 线程池 ✅
 ```
 
-`src/` 下是五个可执行目标 —— 四个服务器跑同一套测试，外加一个线程池演示：
+`src/` 下是七个可执行目标。跑测试的三个（p2 / epoll / thread）在 CI 里全绿，其余四个只保证严格编译零警告：
 
 | 文件 | 并发模型 | 真实代码行 |
 | --- | --- | --- |
 | `src/p2.cpp` | 阻塞串行（一次一条连接） | 172 |
+| `src/p2_route.cpp` | 上者 + 请求行解析 + 路由（实验分支，不进测试矩阵） | 258 |
 | `src/epoll.cpp` | 单线程 Reactor | 194 |
-| `src/thread.cpp` | 单 Reactor + 线程池 | 317 |
-| `src/p2_lib.cpp` | cpp-httplib（库，每连接一线程） | 40 |
-| `src/thread_pool.cpp` | 线程池独立演示（不接服务器） | — |
+| `src/thread.cpp` | 单 Reactor + 线程池 | 370 |
+| `src/thread_uev.cpp` | 上者 + `signalfd` 统一事件源（含优雅停机） | 634 |
+| `src/p2_lib.cpp` | cpp-httplib（库，每连接一线程） | 45 |
+| `src/thread_pool.cpp` | 线程池独立演示（不接服务器） | 15 |
 
 ## 编译与运行
 
 ```bash
 mkdir -p build        # 产物统一输出到 build/（已 gitignore；清理就是 rm -rf build）
 
-# 三个手写版（严格编译：有警告就说明代码不干净）
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp     -o build/p2
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp  -o build/epoll
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp -o build/thread -pthread
+# 五个手写版（严格编译：有警告就说明代码不干净）
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp        -o build/p2
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2_route.cpp  -o build/p2_route
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp     -o build/epoll
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp    -o build/thread -pthread
+g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_uev.cpp -o build/thread_uev -pthread
 
 # 线程池独立演示（不接服务器，单看池子怎么派活）
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_pool.cpp -o build/thread_pool -pthread
@@ -44,7 +48,8 @@ g++ -std=c++17 -O2 src/p2_lib.cpp -o build/p2_lib -pthread -I third_party/cpp-ht
 # 起一个（⚠ 都占 8888，同时只能跑一个）
 ./build/epoll                                  # 或 ./build/p2
 ./build/thread --workers 4                     # 线程池版
-./build/p2_lib                             # cpp-httplib 版（支持 --port N）
+./build/thread_uev --workers 4                 # 线程池 + signalfd，Ctrl+C 会优雅停机
+./build/p2_lib                                 # cpp-httplib 版（支持 --port N）
 ```
 
 端口：手写版在各自源码顶部的 `constexpr uint16_t PORT`；库版用 `--port N`。
@@ -152,7 +157,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 ⚠ 上面那张 p2 的旧表用的是 **JMeter 自己 summary 的吞吐**，和这张表的 `analyze.sh`
 吞吐**分母不同**（同一个 `.jtl`：4935.8/s vs 4499/s）—— **两张表不能直接相除**。
 
-## 已知限制（都还没修，正是后面的学习内容）
+## 已知限制（哪些已修、哪些还没修）
 
 | # | 限制 | 后果 | 状态 |
 | --- | --- | --- | --- |
@@ -160,19 +165,22 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 | 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
 | 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 keep-alive 之后**只剩这一处**，见上面压测结论 ③ |
 | 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`src/epoll.cpp`；2.7× 吞吐） |
-| 5 | `send` 未处理部分写 | 响应很大时可能发不完整 | ⬜ CP6d-3 故意留着（当前响应 117 字节，**撞不到**，写不出会红的测试） |
-| 6 | 没有日志系统、没有优雅退出 | 只用 `std::cout`；`Ctrl+C` 直接终止 | ⬜ 后续 |
-| 7 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 未验证的猜想：它可能正在压着吞吐上限。要验证就造一个"关掉日志"的变体对比 |
+| 5 | `send` 未处理部分写 | 响应很大 + 慢客户端时可能发不完整 | ✅ `thread.cpp` / `thread_uev.cpp` 已加全量校验（`EINTR` 重试；部分写一律按"收掉这条连接"处理）。真正支持要加输出缓冲 + `EPOLLOUT`，暂未做 |
+| 6 | 没有优雅退出 | `SIGTERM` 直接死，在途请求丢 | ✅ `src/thread_uev.cpp` 已修（`signalfd` 统一事件源 + `drain()` 线程池 + 关空闲连接） |
+| 7 | 没有日志系统 | 只有 `std::cout` + 一把锁 | ⬜ 后续 |
+| 8 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 未验证的猜想：它可能正在压着吞吐上限。要验证就造一个"关掉日志"的变体对比 |
 
 ## 目录结构
 
 ```
 .
 ├── src/                        ← 源码（全部 C++17）
-│   ├── p2.cpp                  阻塞版服务器（CP1~CP5）：一次只能服务一条连接
+│   ├── p2.cpp                  阻塞版服务器（CP1~CP5）：一次只能服务一条连接，任何路径都回 Hello
+│   ├── p2_route.cpp            上者 + 请求行解析 + 路由（404/405/400、?query），独立分支不进 CI 测试
 │   ├── epoll.cpp               单线程 Reactor 版（CP6a~CP6d）：一个线程 + 一个 epoll
 │   ├── thread.cpp              单 Reactor + 线程池版：主线程管 IO，工人算业务
-│   ├── p2_lib.cpp          cpp-httplib 对照版（真实代码 40 行）
+│   ├── thread_uev.cpp          上者 + signalfd 统一事件源 + 优雅停机（单文件自包含）
+│   ├── p2_lib.cpp          cpp-httplib 对照版（真实代码 45 行）
 │   ├── http.hpp                三个手写服务器【共用】的 HTTP 逻辑
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   ├── thread_pool.hpp         线程池类（只有一份，两个文件 include 它）
@@ -199,6 +207,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 | 看最朴素的阻塞写法（对照用） | `build/p2` |
 | 看事件驱动、跑协议/配平测试 | `build/epoll` |
 | 看线程池怎么和 epoll 配合 | `build/thread --workers 4` |
+| 看信号怎么进 epoll、怎么优雅停机 | `build/thread_uev --workers 4` |
 | 单独把线程池跑起来看 | `build/thread_pool` |
 
 ## 学习笔记索引

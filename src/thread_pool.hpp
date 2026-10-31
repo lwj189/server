@@ -1,12 +1,12 @@
 // ===========================================================================
-// src/thread_pool.hpp：线程池（只有类，没有 main）
+// thread_pool.hpp：线程池（只有类，没有 main）
 //
 // 为什么要单独做成头文件？
-//   原来 ThreadPool 类写在 src/thread_pool.cpp 里，那个文件还有个 demo main()。
+//   原来 ThreadPool 类写在 thread_pool.cpp 里，那个文件还有个 demo main()。
 //   服务器要用这个类，总不能再抄一份（改一处忘一处，两份代码就会漂移）。
 //   抽成头文件之后：
-//     · src/thread_pool.cpp  —— include 它，跑那个 demo（学习用）
-//     · src/thread.cpp  —— include 它，接真的服务器
+//     · thread_pool.cpp  —— include 它，跑那个 demo（学习用）
+//     · thread.cpp  —— include 它，接真的服务器
 //   同一个类，只有一份。
 //
 // 线程池是什么？（一句话）

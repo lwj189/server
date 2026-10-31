@@ -1,10 +1,10 @@
 // ===========================================================================
-// src/thread.cpp：单 Reactor + 线程池
+// thread.cpp：单 Reactor + 线程池
 //
-// 和 src/epoll.cpp 的唯一区别是【谁来干活】：
+// 和 epoll.cpp 的唯一区别是【谁来干活】：
 //
-//   src/epoll.cpp       主线程：收连接 → 读 → 解析 → 算业务 → 发响应   （全程一个线程）
-//   src/thread.cpp 主线程：收连接 → 读 → 解析 ──┐
+//   epoll.cpp       主线程：收连接 → 读 → 解析 → 算业务 → 发响应   （全程一个线程）
+//   thread.cpp 主线程：收连接 → 读 → 解析 ──┐
 //                                              └→ 线程池：算业务 → 发响应
 //
 // 为什么要这么拆？
@@ -18,7 +18,7 @@
 //
 // fd 的交接协议（这是本文件最需要小心的地方）：
 //   主线程解析出完整请求后：
-//     ① ctx.busy = true      标记"这条连接现在归工人管"
+//     ① setBusy(fd, true)    标记"这条连接现在归工人管"（走锁，别裸写字段）
 //     ② EPOLL_CTL_DEL        从 epoll 摘掉 —— 否则 LT 模式下它会继续通知主线程，
 //                            主线程就会和工人同时操作同一个 fd（数据竞争）
 //     ③ pool.submit(...)     把 (fd, 请求) 打包丢进队列
@@ -30,10 +30,10 @@
 //     没有它，keep-alive 就没了（一条连接只能服务一个请求）。
 //
 // 编译运行（-pthread 必须加）：
-//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp -o build/thread -pthread
-//     build/thread                       # 4 个工人 + 每请求日志
-//     build/thread --workers 1           # 只开 1 个工人（用来证明"多核真的有用"）
-//     build/thread --quiet               # 关掉每请求日志（压测时用）
+//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread.cpp -o thread -pthread
+//     ./thread                       # 4 个工人 + 每请求日志
+//     ./thread --workers 1           # 只开 1 个工人（用来证明"多核真的有用"）
+//     ./thread --quiet               # 关掉每请求日志（压测时用）
 // ===========================================================================
 
 #include "http.hpp"          // ClientContext / parseRequest / buildResponse / logLine
@@ -107,29 +107,60 @@ static std::string requestTarget(const std::string& raw) {
     return raw.substr(sp1 + 1, sp2 - sp1 - 1);
 }
 
-// 从 "/work?n=100" 里取出 n；没有就用默认值，超上限就截到上限
-static unsigned long long workUnits(const std::string& target) {
-    const size_t q = target.find("n=");
-    if (q == std::string::npos) return DEFAULT_WORK_UNITS;
+// 从请求目标里切出 path（问号之前的那一段）：
+//     "/work?n=100" -> "/work"
+//     "/worker"     -> "/worker"
+//
+// ⚠ 为什么必须切开、再拿【整串】比：原来这里是
+//       if (target.rfind("/work", 0) != 0)      // 前缀匹配
+//   它把 "/worker" / "/workshop" 也当成 /work 吃了 —— 一个和业务毫无关系的路径，
+//   只要起手是这五个字符，就能让服务器去烧 CPU（白送一个 DoS 面）。
+//   判据：curl localhost:8888/worker 会拿到 "CPU work done"。
+static std::string pathOf(const std::string& target) {
+    const size_t q = target.find('?');
+    return target.substr(0, q == std::string::npos ? target.size() : q);
+}
 
-    const char* p = target.c_str() + q + 2;
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(p, &end, 10);
-    if (end == p) return DEFAULT_WORK_UNITS;   // "n=" 后面没有数字
-    return v > MAX_WORK_UNITS ? MAX_WORK_UNITS : v;
+// 从 query 串（"n=100" / "a=1&n=100"）里取出 n；没有就用默认值，超上限截到上限
+//
+// ⚠ 为什么按 & 切参数、而不是直接在 target 里 find("n=")：
+//   "?foo=n=5" 里也含 "n=" —— 直接 find 会把它当成 n=5。
+//   按参数边界找，只有"整个参数名恰好是 n"才算数。
+static unsigned long long workUnits(const std::string& query) {
+    size_t pos = 0;
+    while (pos < query.size()) {
+        const size_t amp = query.find('&', pos);
+        const size_t end = (amp == std::string::npos) ? query.size() : amp;
+        if (end - pos > 2 && query.compare(pos, 2, "n=") == 0) {
+            const char* p = query.c_str() + pos + 2;
+            char* stop = nullptr;
+            const unsigned long long v = std::strtoull(p, &stop, 10);
+            // 值必须是纯数字：空的、或者后面跟着非法字符，都算"没给"
+            if (stop != p && (*stop == '\0' || *stop == '&')) {
+                return v > MAX_WORK_UNITS ? MAX_WORK_UNITS : v;
+            }
+            return DEFAULT_WORK_UNITS;
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return DEFAULT_WORK_UNITS;
 }
 
 // 根据请求算出响应体 —— 这就是"业务处理"，工人线程执行的就是它
 static std::string doBusiness(const std::string& raw) {
     const std::string target = requestTarget(raw);
+    const std::string path = pathOf(target);
 
-    if (target.rfind("/work", 0) != 0) {
-        // 普通请求：和 src/epoll.cpp 返回完全一样的东西
+    if (path != "/work") {
+        // 普通请求：和 epoll.cpp 返回完全一样的东西
         // （这样 p2_test.py 那 23 项协议测试对两个服务器都成立）
         return "<h1>Hello from my own server!</h1>";
     }
 
-    const unsigned long long n = workUnits(target);
+    const size_t q = target.find('?');
+    const std::string query = (q == std::string::npos) ? std::string() : target.substr(q + 1);
+    const unsigned long long n = workUnits(query);
     const uint64_t sum = burnCpu(n);
     return "<h1>CPU work done</h1><p>units=" + std::to_string(n) +
            "</p><p>checksum=" + std::to_string(sum) + "</p>";
@@ -170,7 +201,7 @@ static void setBusy(int fd, bool busy) {
 // ===========================================================================
 // ⚠⚠ 本文件最要命的一条规矩：收连接时必须【先 eraseCtx，再 close】
 //
-// 反过来写会怎样（哨兵会先喊出来，而且喊的是冤枉话）：
+// 反过来写会怎样（实测踩到过，而且是哨兵先喊出来的）：
 //
 //     工人： close(fd=5)          ← 号码 5 立刻可以被内核复用
 //     主线程：accept(...) 拿到 fd=5 → g_clients.emplace(5) 失败
@@ -187,19 +218,39 @@ static void setBusy(int fd, bool busy) {
 // ===========================================================================
 
 // 工人处理【一个】已经解析出来的请求。返回 false = 这条连接已经收掉了。
+//
+// ⚠ 这里原来有个真 bug：send 失败只 perror 一句，然后 want_close==false 时
+//   照样把 fd 还回去。可 send 返回 -1 意味着【这条连接已经断了】
+//   （SIGPIPE 被忽略时是 EPIPE；对端发 RST 是 ECONNRESET）。还回去的结果：
+//     · 主线程捧着一条死连接，等一个永远不会再来的 EPOLLIN；
+//     · 断线永远没人回收 → fd 泄漏 → 最后撞 EMFILE。
+//   正确做法：send 失败 = 这条连接没救了，当场收掉（销账 + close）。
+//
+//   还有 sent < size 的【部分写】：非阻塞 fd 上这是真实存在的（大响应 + 慢客户端）。
+//   本实现没有输出缓冲 + EPOLLOUT，所以部分写也一并按"收掉"处理 ——
+//   宁可丢一个响应，也不能留下一条状态对不上的连接。
+//   （要真正支持部分写，得给每条连接加 outbuf、注册 EPOLLOUT，那是下一步的事。）
 static bool workerHandleOne(int fd, const std::string& raw, bool want_close) {
     const std::string body = doBusiness(raw);
     const std::string response = buildResponse(body, want_close);
 
-    // ⚠ 非阻塞 fd 上的 send：小响应不会 EAGAIN；部分写（0 < sent < size）
-    //   要等响应变大才撞得到，那时候要加输出缓冲 + EPOLLOUT（暂未做）
-    const ssize_t sent = send(fd, response.c_str(), response.size(), 0);
+    bool broken = false;
+    ssize_t sent = send(fd, response.c_str(), response.size(), 0);
+    while (sent < 0 && errno == EINTR) {   // 被信号打断：这次没发出去，重来一次
+        sent = send(fd, response.c_str(), response.size(), 0);
+    }
     if (sent < 0) {
-        perror("send");
+        perror("send");   // EPIPE / ECONNRESET / EAGAIN —— 都是"这条连接不可用了"
+        broken = true;
+    } else if (static_cast<size_t>(sent) < response.size()) {
+        logLine("send 只发出一部分 fd=" + std::to_string(fd) + "（" +
+                std::to_string(sent) + "/" + std::to_string(response.size()) +
+                "）—— 没有输出缓冲，只能丢弃这条连接");
+        broken = true;
     }
 
-    if (want_close) {
-        // 客户端要求关（或这条连接被判非法）→ 两本账一起销
+    if (want_close || broken) {
+        // 客户端要求关 / 这条连接被判非法 / 已经断了 → 两本账一起销
         eraseCtx(fd);   // ← 先销账
         close(fd);      // ← 再归还号码（顺序见上面的长注释）
         return false;
@@ -263,7 +314,14 @@ static void handleInPool(int fd, std::string raw, bool want_close) {
     ev.events = EPOLLIN;
     ev.data.fd = fd;
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        // ⚠ 这里原来也只 perror 一句就完了 —— 那是【双泄漏】：
+        //     ADD 失败 = 主线程从此收不到这条连接的事件 = 这条连接没人管了；
+        //     而 fd 还开着、账本条目也还在 → fd 和内存同时漏。
+        //   epoll 实例满（ENOSPC）或 fd 已在别的 epoll 里（EEXIST）都会走到这。
+        //   既然没人再看得见它，只有一种收场：销账 + close。
         perror("epoll_ctl: ADD back");
+        eraseCtx(fd);
+        close(fd);
     }
 }
 
@@ -279,15 +337,43 @@ static void handOffToPool(ClientContext& ctx, size_t total) {
     }
 
     // ① 标记 + 消费字节（inbuf 归主线程管，趁现在处理干净）
-    ctx.busy = true;
+    //
+    // ⚠ 原来这里是 ctx.busy = true，直接写字段 —— 这是本文件里【唯一】一处
+    //   不经过锁就动 ctx 的地方。busy 是跨线程字段（工人/主线程都读它），
+    //   这里裸写又没有同步，等于把"这条连接归谁"这件事实交给了编译器和 CPU 的重排。
+    //   统一走 setBusy()：同一把锁进、同一把锁出，读和写看到的是同一个值。
+    setBusy(ctx.fd, true);
     ctx.inbuf.erase(0, total);
 
     // ② 从 epoll 摘掉 —— 不摘的话 LT 会继续通知主线程，两边同时操作同一个 fd
+    //   参数传 nullptr：man 2 epoll_ctl 明说 EPOLL_CTL_DEL 时 event 参数【会被内核忽略】
+    //   （Linux 2.6.9 之后允许传 NULL）。epoll.cpp 那边传的是 &ev ——
+    //   同一件事两种写法，读代码时容易以为是两个不同的语义。现在统一成 nullptr。
     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx.fd, nullptr);
 
     // ③ 丢进队列（按值捕获，别传引用）
     const int fd = ctx.fd;
     g_pool->submit([fd, raw, want_close] { handleInPool(fd, raw, want_close); });
+}
+
+// ===========================================================================
+// 命令行参数：把字符串读成无符号整数，失败【不抛异常】
+//
+// ⚠ 原来用的是 std::stoul，三个坑全在：
+//     · "abc"  → 抛 std::invalid_argument，没人接 → std::terminate → 直接崩；
+//     · "-1"   → stoul 会【静默接受】负号并回绕成 18446744073709551615（见 man）；
+//     · "12x"  → 返回 12，尾巴的 "x" 被无声吞掉。
+//   全是"用户手滑多打一个字符，服务器崩了 / 配了个荒唐值"。
+//   改成 strtoull + 全串校验：整串必须都是数字、不溢出、范围再由调用方卡。
+// ===========================================================================
+static bool parseUnsigned(const char* s, unsigned long long& out) {
+    if (s == nullptr || *s == '\0' || *s == '-') return false;   // 空串 / 负号都不收
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return false;   // 溢出 / 没读到数 / 尾巴有垃圾
+    out = v;
+    return true;
 }
 
 // ===========================================================================
@@ -297,10 +383,19 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+        unsigned long long v = 0;
         if (a == "--workers" && i + 1 < argc) {
-            workers = std::stoul(argv[++i]);
+            if (!parseUnsigned(argv[++i], v) || v == 0 || v > 1024) {
+                std::cerr << "--workers 需要 1..1024 的整数，收到: " << argv[i] << "\n";
+                return 2;
+            }
+            workers = static_cast<size_t>(v);
         } else if (a == "--port" && i + 1 < argc) {
-            port = static_cast<uint16_t>(std::stoul(argv[++i]));
+            if (!parseUnsigned(argv[++i], v) || v == 0 || v > 65535) {
+                std::cerr << "--port 需要 1..65535 的整数，收到: " << argv[i] << "\n";
+                return 2;
+            }
+            port = static_cast<uint16_t>(v);
         } else if (a == "--quiet") {
             g_log_requests = false;
         } else {
@@ -328,7 +423,7 @@ int main(int argc, char** argv) {
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(server_fd, SOMAXCONN) < 0) {   // backlog 拉满（和 src/epoll.cpp 同一个教训）
+    if (listen(server_fd, SOMAXCONN) < 0) {   // backlog 拉满（和 epoll.cpp 同一个教训）
         perror("listen"); return 1;
     }
 
@@ -358,7 +453,7 @@ int main(int argc, char** argv) {
     size_t paused_at = 0;
 
     while (true) {
-        // EMFILE 撞墙后的恢复判断（和 src/epoll.cpp 同一套）
+        // EMFILE 撞墙后的恢复判断（和 epoll.cpp 同一套）
         if (accept_paused) {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             if (g_clients.size() < paused_at) {
@@ -427,10 +522,21 @@ int main(int argc, char** argv) {
 
                     ClientContext ctx;
                     ctx.fd = conn_fd;
-                    std::lock_guard<std::mutex> lock(g_clients_mutex);
-                    if (!g_clients.emplace(conn_fd, ctx).second) {
+                    bool dup = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_clients_mutex);
+                        dup = !g_clients.emplace(conn_fd, ctx).second;
+                    }
+                    if (dup) {
+                        // ⚠ 原来是"打一行日志，然后拿这条新连接当正常的用"。
+                        //   可账本里那条【旧】条目还占着这个号码 —— 主线程之后 findCtx(fd)
+                        //   拿到的是【旧连接】的 ctx（inbuf / want_close / busy 全是它的）。
+                        //   结果：新连接的数据被写进旧连接的缓冲，旧连接的关闭状态被套到新连接上。
+                        //   哨兵既然已经喊出"漏了 erase"，这条连接就该当毒药处理 —— 当场关掉。
                         logLine("账本里已经有 fd=" + std::to_string(conn_fd) +
-                                " —— 上一个连接漏了 erase");
+                                " —— 上一个连接漏了 erase，丢弃这条新连接");
+                        close(conn_fd);   // 关闭会自动从 epoll 摘除，不必再 EPOLL_CTL_DEL
+                        continue;         // 回去 accept 下一条
                     }
                 }
             } else {

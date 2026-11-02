@@ -1,103 +1,18 @@
 // ===========================================================================
 // src/thread_uev.cpp：单 Reactor + 线程池 + 统一事件源（自包含单文件）
-//
-// 这个文件是什么？
-//   src/epoll.cpp  —— 单 Reactor：一个线程既收连接又算业务
-//   src/thread.cpp —— 单 Reactor + 线程池：主线程只碰 IO，业务丢给工人
-//   本文件 = 把两边的"内容"合进一个文件，再加一样 thread.cpp 没有的东西：
-//   【统一事件源】—— 信号不再用 signal handler 处理，而是变成 epoll 里的一个 fd。
-//
-// 为什么单开一个文件，而不是继续改 thread.cpp？
-//   1. 自包含：HTTP 解析（原 http.hpp）、线程池（原 thread_pool.hpp）、
-//      epoll 主循环全在同一份里 —— 从 accept 到 send 一条线读下来，不用来回跳文件。
-//   2. 它多了 thread.cpp 没有的行为（signalfd + 优雅停机），
-//      混进 thread.cpp 会让"36 项测试守着的那份基线"变样。
-//   3. 两个文件可以对照着读：先看 thread.cpp 懂模型，再看这里看统一事件源。
-//
-// ===========================================================================
-// 【统一事件源】到底是什么
-//
-// 朴素写法（很多教程）：
-//     volatile sig_atomic_t g_stop = 0;
-//     void onSignal(int) { g_stop = 1; }          // handler 里只置标志
-//     signal(SIGINT, onSignal);
-//     while (!g_stop) { epoll_wait(...); ... }
-//   三个毛病：
-//     · handler 里只能调 async-signal-safe 的函数（不能 printf/cout/malloc，
-//       甚至不能 epoll_ctl）—— 真要"立刻处理"，能做的事几乎没有；
-//     · 信号随时可能打断主线程正在做的事，标志位什么时候被看到不确定；
-//     · 在 epoll_wait 里被打断只会返回 EINTR，你还得专门处理它。
-//
-// 统一事件源（本文件）：
-//     ① sigprocmask 先把 SIGINT/SIGTERM 【屏蔽】（信号只挂起，不投递）
-//     ② signalfd(-1, &mask, ...) 把"挂起的信号"变成一个可读的 fd
-//     ③ 把这个 fd 注册进 epoll
-//     ④ epoll_wait 返回它 → read 出 struct signalfd_siginfo → 和连接事件一样处理
-//
-//   好处：信号处理变成普通 IO，主循环只有一处等待（epoll_wait），
-//   不用 handler、不用全局 volatile 标志、不用处理 EINTR 之外的"异步打断"。
-//   书上的 socketpair/self-pipe 是同一招的前身：handler 里 write 一个字节，
-//   主循环读那个管道 —— 还是得在 handler 里干活（write 是 async-signal-safe 的）。
-//   signalfd 把这根管道和 handler 全省了。
-//
-// ⚠ 屏蔽必须发生在【创建线程之前】：线程会继承创建者的信号掩码。
-//   否则 SIGTERM 可能被某个工人线程领走，主线程的 epoll_wait 永远等不到它。
-//
-// ===========================================================================
-// 【优雅停机】为什么不是收到信号就 return 0
-//
-// 收到 SIGTERM 时，可能有：
-//   · 工人手里正在算 /work 的任务（响应还没发）
-//   · 队列里排着的任务
-//   · 一堆 keep-alive 的空闲连接
-// 直接 return 0 / exit() 会让前两种的响应永远发不出去，客户端看到半截或 RST。
-//
-// 本文件的顺序：
-//   ① 信号事件里：置 g_stopping、从 epoll 摘掉并 close listen fd（不再接新连接）
-//   ② 退出事件循环
-//   ③ 关掉"空闲"连接（busy == false 的那些）
-//   ④ 线程池 drain()：把队列排空、等在途任务全部干完（工人会把响应发完）
-//   ⑤ 关 epoll/signalfd，退出码 0
-//   ★ 第 ③ 步只关 busy == false 的：busy == true 的 fd 归工人管，
-//     主线程碰它就是 use-after-close。
-//
-// ===========================================================================
-// 【fd 的交接协议】（和 src/thread.cpp 一个字都不差的协议）
-//   主线程：解析出完整请求 → busy=true → EPOLL_CTL_DEL → 打包任务丢进队列
-//   工人  ：send → 要关就 eraseCtx+close；要留就 busy=false + EPOLL_CTL_ADD 还回去
-//   ★ 工人还 fd 前必须把 inbuf 里已经到齐的请求处理干净 —— 那些字节在用户态，
-//     内核不会因为它们再报 EPOLLIN（keepalive_test 的 [2] 就挂在这条上）。
-//
-// 【和 src/thread.cpp 的差异】（都是有意改的，不是两份代码在漂移）
-//   1. 信号 → signalfd，和 listen fd / 连接 fd 一起进 epoll（本文件新增）
-//   2. 优雅停机：drain 线程池 + 关空闲连接（thread.cpp 收到 SIGTERM 直接死）
-//   3. 结构：本文件把 src/http.hpp、src/thread_pool.hpp 合了进来（自包含，
-//      单个文件就能编；thread.cpp 仍然是 3 个文件一起编）
-//
-//   ⚠ 这份清单原来还列着 5 条（/work 前缀匹配、workUnits 的 find("n=")、
-//     send 只 perror、ADD back 只 perror、stoul 崩）—— 那 5 项描述的是
-//     【未加固版】thread.cpp。它们后来都在 thread.cpp 里逐条修掉了：
-//       · pathOf / workUnits 切参数      src/thread.cpp:119 / :129
-//       · send 失败与部分写收连接        src/thread.cpp:233
-//       · EPOLL_CTL_ADD back 失败收连接  src/thread.cpp:275（:316 处）
-//       · parseUnsigned 严格解析参数     src/thread.cpp:369
-//     所以现在只剩上面 1~3 条是真差异，别的都是两边一样的。
-//
-// 编译运行（-pthread 必须加）：
-//   g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -pthread src/thread_uev.cpp -o build/thread_uev
-//   build/thread_uev                    # 4 个工人 + 每请求日志
-//   build/thread_uev --workers 1        # 单工人（对照多核收益）
-//   build/thread_uev --quiet            # 压测时关每请求日志
-//
-// 验收（和 thread.cpp 用同一套测试，一行都不用改）：
-//   python3 tests/p2_test.py
-//   python3 tests/balance_test.py
-//   python3 tests/keepalive_test.py --bin build/thread_uev
-//   python3 tests/emfile_test.py   --bin build/thread_uev
-// 优雅停机手测：
-//   build/thread_uev --quiet &
-//   curl -s 'http://127.0.0.1:8888/work?n=20000000' &   # 在途请求
-//   kill -TERM %1                                       # 服务器等它答完再退
+// 【统一事件源】sigprocmask 先屏蔽 SIGINT/SIGTERM → signalfd 变成一个可读 fd → 注册进同一个
+// epoll。信号处理退化成普通 IO：只有一处 epoll_wait 在等，不用 handler（受 async-signal-safe
+// 约束），也没有 volatile 标志、不用单独处理 EINTR。⚠ 屏蔽必须在建线程之前（线程继承掩码），
+// 否则 SIGTERM 可能被某个工人领走，主线程的 epoll_wait 永远等不到。
+// 【优雅停机】① 信号事件里置 g_stopping、EPOLL_CTL_DEL + close listen fd（不再接新连接）
+// → ② 退出事件循环 → ③ 只关 busy==false 的空闲连接（busy 的归工人，主线程碰就是
+// use-after-close）→ ④ pool.drain() 排空队列、等工人把响应发完 → ⑤ 关 epoll/signalfd 返回 0。
+// 【与 thread.cpp 的有意差异】1. 信号改 signalfd，与 listen/连接 fd 进同一个 epoll（本文件独有）；
+// 2. 优雅停机：drain 线程池 + 关空闲连接（thread.cpp 收到 SIGTERM 直接死）；3. 自包含：
+// src/http.hpp、src/thread_pool.hpp 并了进来，单文件即可编译。其余两边一致，不是代码在漂移。
+// 【fd 交接协议】busy=true → EPOLL_CTL_DEL → submit；工人 busy=false + EPOLL_CTL_ADD 还回，或 erase+close
+// 编译：g++ -std=c++17 -pthread src/thread_uev.cpp -o build/thread_uev
+// 运行：build/thread_uev [--workers N] [--port N] [--quiet]；验收 tests/{p2,balance,keepalive,emfile}_test.py
 // ===========================================================================
 
 #include <arpa/inet.h>     // inet_ntop
@@ -145,13 +60,9 @@ constexpr unsigned long long MAX_WORK_UNITS = 20'000'000ULL;
 constexpr unsigned long long DEFAULT_WORK_UNITS = 200'000ULL;
 
 // ===========================================================================
-// 日志：多线程下必须"整行原子"
-//
-// std::cout << a << b << c 是三次调用，两个线程同时写会交错成
-// "新连接 fd=新连接 fd=57"。而测试里有按行读日志的（keepalive_test 找
-// 'GET /first'、balance_test 找"账本里"哨兵）—— 日志一乱就变成假红。
-//
-// ⚠ std::endl 会 flush：日志重定向到文件时测试才能及时读到，不能换成 '\n'。
+// 日志：必须"整行原子" —— cout << a << b << c 是三次调用，两线程同写会交错成
+// "新连接 fd=新连接 fd=57"；测试按行读日志（keepalive_test 找 'GET /first'）一乱就假红。
+// ⚠ std::endl 会 flush：重定向到文件时测试才能及时读到，不能换成 '\n'。
 // ===========================================================================
 inline std::mutex g_log_mutex;
 
@@ -164,10 +75,8 @@ inline void logLine(const std::string& line) {
 inline bool g_log_requests = true;
 
 // ===========================================================================
-// 每条连接的状态
-//
-// "一条连接"不能只是一个 fd 号：半包/粘包要求把"已经收到哪儿了"存下来，
-// 而事件处理的栈帧活不到下一次事件 —— 状态必须搬到外面的容器里。
+// 每条连接的状态：半包/粘包要求把"收到哪儿了"存下来，而事件处理的栈帧活不到
+// 下一次事件 —— 状态必须搬到外面的容器里。
 // ===========================================================================
 struct ClientContext {
     int fd = -1;
@@ -175,14 +84,11 @@ struct ClientContext {
     // 这条连接自己的读缓冲区（一次 read 可能只是半个请求）
     std::string inbuf;
 
-    // 回完【当前】请求之后要不要关？
-    //   true  = 客户端在头里说了 Connection: close，或这条连接被判非法
-    //   false = 留着继续服务（HTTP/1.1 默认行为）
+    // 回完当前请求后关不关：true = 客户端说了 Connection: close（或这条连接被判非法）
     bool want_close = false;
 
-    // true = 这条连接的 fd 已经 EPOLL_CTL_DEL 掉、正躺在工人手里。
-    // 主线程看到 busy 就必须完全别碰它（不 read、不解析、不 close），
-    // 否则就是两个线程同时操作同一个 fd（数据竞争 / use-after-close）。
+    // true = fd 已 EPOLL_CTL_DEL 掉、正躺在工人手里：主线程看到 busy 必须完全别碰
+    // （不 read、不解析、不 close），否则就是两个线程抢同一个 fd（use-after-close）。
     bool busy = false;
 };
 
@@ -346,15 +252,9 @@ static std::string buildResponse(const std::string& body, bool want_close) {
 }
 
 // ===========================================================================
-// 线程池（原 src/thread_pool.hpp，加了一个 drain()）
-//
-// 三个成员各管一件事：
-//   tasks_ —— 待办清单
-//   mtx_   —— 清单的锁
-//   cv_    —— 门铃（"来活了" / "下班了"）
-//
-// 和原版唯一的区别：析构前可以显式 drain()，把"排空队列"这一步
-// 从析构函数里拿出来，方便在 main 里先 log 一句"开始等在途任务"。
+// 线程池（原 src/thread_pool.hpp，多了一个 drain()）
+// drain 把"排空队列"从析构里拿出来，方便 main 先打一句"开始等在途任务"；
+// stop_ 置 true 后工人先把剩下的活干完才退休（见 workerLoop 的退出条件）。
 // ===========================================================================
 class ThreadPool {
 public:
@@ -378,13 +278,11 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             tasks_.push(std::move(task));
         }
-        // 解锁之后才按门铃（否则被唤醒的工人会卡在锁上）
+        // 解锁之后再 notify，否则被唤醒的工人立刻又卡在锁上
         cv_.notify_one();
     }
 
-    // 排空队列 + 等所有工人收工。
-    // stop_ 置 true 之后，工人会【先把剩下的活干完】再退休
-    //（见 workerLoop 里 if (stop_ && tasks_.empty()) return;）。
+    // 排空队列 + join 所有工人；幂等（析构还会再调一次）。
     void drain() {
         if (joined_) return;   // 析构还会再调一次，别 join 两次
         {
@@ -406,11 +304,9 @@ private:
         while (true) {
             std::function<void()> task;
             {
-                // unique_lock 才能中途解锁；condition_variable::wait 需要这个能力
                 std::unique_lock<std::mutex> lock(mtx_);
                 cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
 
-                // 收到下班通知，而且清单空了 → 退休
                 if (stop_ && tasks_.empty()) return;
 
                 task = std::move(tasks_.front());
@@ -432,11 +328,9 @@ private:
 // ===========================================================================
 // 跨线程共享的东西
 //
-// 这个文件里【唯一】需要保护的是 g_clients 这张表：
-//   · 主线程会 emplace（新连接）/ erase（连接结束）/ 读 inbuf
-//   · 工人要改 ctx.busy，并在还 fd 前处理 inbuf 里排队的请求
-// 读/写 inbuf 不用额外锁：fd 交出去之前已经 EPOLL_CTL_DEL 了，
-// 主线程不会再收到这条连接的事件 —— 分工是清楚的。
+// 唯一需要保护的是 g_clients 这张表：主线程 emplace / erase / 读 inbuf，工人改
+// ctx.busy 并在还 fd 前处理 inbuf 里排队的请求。inbuf 本身不用再加锁 ——
+// fd 交出去之前已 EPOLL_CTL_DEL，主线程不会再收到这条连接的事件。
 // ===========================================================================
 static ThreadPool* g_pool = nullptr;
 static int g_epoll_fd = -1;
@@ -444,16 +338,13 @@ static int g_signal_fd = -1;
 static std::mutex g_clients_mutex;
 static std::unordered_map<int, ClientContext> g_clients;
 
-// 停机标志：信号事件里置 true；工人还 fd 前要看它 ——
-// 停机中就不再把 fd 还回 epoll，直接收掉（否则主循环已经退出，
-// 还回去的 fd 会一直挂着，还白打一条 epoll_ctl 失败的日志）。
+// 停机标志：信号事件里置 true；工人还 fd 前要看它 —— 停机中就不再还回 epoll，
+// 直接收掉（主循环已退出，还回去的 fd 会一直挂着，还白打一条失败日志）。
 static std::atomic<bool> g_stopping{false};
 
 // ===========================================================================
-// 业务：真的吃 CPU
-//
-// xorshift64 —— 每一步都用上一步的结果，编译器没法把它优化掉。
-// 如果写成"空循环 n 次"，-O2 会直接把整个循环删掉，测出来的就是假的。
+// 业务：真的吃 CPU（xorshift64 —— 每一步都用上一步的结果，编译器没法优化掉；
+// 写成"空循环 n 次"的话 -O2 会把整个循环删掉，测出来的是假 CPU）
 // ===========================================================================
 static uint64_t burnCpu(unsigned long long n) {
     uint64_t x = 0x9e3779b97f4a7c15ULL;   // 随便一个非零种子
@@ -518,8 +409,7 @@ static std::string doBusiness(const std::string& raw) {
     const std::string target = requestTarget(raw);
 
     if (pathOf(target) != "/work") {
-        // 普通请求：和 src/epoll.cpp 返回完全一样的东西
-        // （这样 p2_test.py 那 23 项协议测试对三个服务器都成立）
+        // 普通请求：和 src/epoll.cpp 返回完全一样 —— p2_test.py 那 23 项协议测试才对三个服务器都成立
         return "<h1>Hello from my own server!</h1>";
     }
 
@@ -556,15 +446,10 @@ static void eraseCtx(int fd) {
 // ===========================================================================
 // ⚠⚠ 本文件最要命的一条规矩：收连接时必须【先 eraseCtx，再 close】
 //
-// 反过来写会怎样（哨兵会先喊出来，而且喊的是冤枉话）：
-//   工人： close(fd=5)          ← 号码 5 立刻可以被内核复用
-//   主线程：accept 拿到 fd=5 → g_clients.emplace(5) 失败
-//           → 哨兵喊"账本里已经有 fd=5" ← 冤枉！
-//   工人： eraseCtx(5)          ← 把【新连接】的账销掉了
-//   结果：新连接不在账本里 → 主线程 findCtx 返回 nullptr → 那条连接再也没人管，
-//   fd 一直泄漏。
-//
-// 一句话：fd 是会被复用的号码，所以"销账"必须发生在"归还号码"之前。
+// 反过来写：工人 close(fd=5) → 号码 5 立刻被内核复用 → 主线程 accept 拿到
+// fd=5、emplace 失败，哨兵喊"账本里已经有 fd=5"（冤枉）→ 工人再 eraseCtx(5)
+// 把【新连接】的账销掉 → 新连接 findCtx 返回 nullptr，再没人管，fd 泄漏。
+// 一句话：fd 是会被复用的号码，销账必须发生在归还号码之前。
 // ===========================================================================
 static void dropClient(int fd) {
     eraseCtx(fd);   // ← 先销账
@@ -574,11 +459,9 @@ static void dropClient(int fd) {
 // ===========================================================================
 // 工人：发响应
 //
-// ⚠ 没有输出缓冲 + EPOLLOUT，所以"发不完"不能等 —— 只能判定这条连接坏了。
-//   小响应（几十字节）不会撞到，但代码不能假设 send 一定一次发完：
-//   非阻塞 fd 上 send 可能返回部分写入（EAGAIN），剩下的字节必须有人保管，
-//   而这里没有保管的地方（thread.cpp 是同样的取舍：部分写就收掉连接）。
-//   所以：要么一次发完，要么收掉连接 —— 绝不留半条响应在连接上继续复用。
+// 没有输出缓冲 + EPOLLOUT，所以"发不完"不能等：非阻塞 fd 上 send 可能部分写入
+// （EAGAIN），剩下的字节没人保管（thread.cpp 同样取舍）。要么一次发完，
+// 要么收掉连接 —— 绝不留半条响应在连接上继续复用。EINTR 重试，MSG_NOSIGNAL 不炸进程。
 // ===========================================================================
 static bool sendAll(int fd, const std::string& data) {
     size_t off = 0;
@@ -618,15 +501,11 @@ static bool workerHandleOne(int fd, const std::string& raw, bool want_close) {
 // ===========================================================================
 // 【工人线程】算业务 → 发响应 → 把 fd 还回去（或收掉）
 //
-// 参数全是按值捕获：fd / 请求文本 / 要不要关。
-// 不能传 ClientContext 的引用 —— 那条连接的上下文归主线程管，
-// 工人只在需要碰 inbuf / busy 时短暂进去改一下（而且要拿锁）。
-//
-// ★ 中间那个 while 是踩出来的：
-//   客户端可能一次发了两个请求（粘包）。主线程只解析出第一个就交出来了，
-//   第二个还在 ctx.inbuf 里 —— 那是用户态缓冲区，不在内核里。
-//   所以就算把 fd 还回去，epoll 也不会报 EPOLLIN，第二个请求永远没人管。
-//   → 工人必须自己把 inbuf 里排队的请求处理干净，再还 fd。
+// 参数全按值捕获；不能传 ClientContext 的引用 —— 上下文归主线程管，工人只在需要
+// 碰 inbuf / busy 时拿锁短暂进去改一下。
+// ★ 中间那个 while 是踩出来的：客户端一次发了两个请求（粘包），主线程只交出去第一个，
+//   第二个还在 ctx.inbuf —— 那是用户态缓冲区，把 fd 还回去 epoll 也不会再报 EPOLLIN，
+//   第二个请求永远没人管。→ 工人必须把 inbuf 里排队的请求处理干净，再还 fd。
 // ===========================================================================
 static void handleInPool(int fd, std::string raw, bool want_close) {
     if (!workerHandleOne(fd, raw, want_close)) {
@@ -661,11 +540,9 @@ static void handleInPool(int fd, std::string raw, bool want_close) {
     }
 
     // ---- 把 fd 还回去，让主线程继续照看这条连接（keep-alive 靠这一步）----
-    // 顺序讲究：先清 busy，再 EPOLL_CTL_ADD —— 两步必须在同一个临界区里，
-    // 否则主线程的停机扫描可能看到 busy==false 就把 fd 关了，工人随后
-    // 对着一个已经关闭（甚至已被复用的）号码做 ADD。
-    //
-    // 停机中（g_stopping）则不再还回去：主循环已经/即将退出，还回去没人管。
+    // 先清 busy 再 EPOLL_CTL_ADD，两步必须同一临界区：否则停机扫描看到 busy==false
+    // 就把 fd 关了，工人随后对着已关闭（甚至已复用）的号码做 ADD。
+    // 停机中（g_stopping）不再还：主循环已经/即将退出，还回去没人管。
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         const auto it = g_clients.find(fd);
@@ -768,9 +645,8 @@ static void handleSignalEvent(int& server_fd) {
 
 // ===========================================================================
 // 停机第二步：关掉所有"空闲"连接（busy == false）
-//
-// busy == true 的 fd 正躺在工人手里，主线程碰它是 use-after-close；
-// 那些会由工人在发完响应后自己收掉（见 handleInPool 的 g_stopping 分支）。
+// busy == true 的 fd 正躺在工人手里，主线程碰它是 use-after-close；那些由工人
+// 发完响应后自己收掉（见 handleInPool 的 g_stopping 分支）。
 // ===========================================================================
 static void closeIdleConnections() {
     size_t closed = 0;
@@ -823,12 +699,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // SIGPIPE：对端已关时 send 会触发它，默认动作是杀进程。
-    // 这里忽略 + send 用 MSG_NOSIGNAL 双保险（有些环境会清掉 SIG_IGN）。
+    // SIGPIPE：对端已关时 send 会触发，默认动作是杀进程。忽略它 + MSG_NOSIGNAL 双保险。
     signal(SIGPIPE, SIG_IGN);
 
-    // ⚠ 必须在建线程之前屏蔽信号（线程继承掩码）；
-    //   否则 SIGTERM 可能被某个工人线程领走，主线程等不到。
+    // ⚠ 必须在建线程之前屏蔽（线程继承掩码），否则 SIGTERM 可能被工人线程领走。
     g_signal_fd = setupSignalFd();
     if (g_signal_fd < 0) return 1;
 
@@ -911,14 +785,14 @@ int main(int argc, char** argv) {
             const int fd = events[i].data.fd;
 
             if (fd == g_signal_fd) {
-                // ---------- 统一事件源：信号到了 ----------
+                // ---------- 信号（统一事件源）----------
                 handleSignalEvent(server_fd);
                 exit_loop = true;
                 break;
             }
 
             if (fd == server_fd) {
-                // ---------- 总机：新连接 ----------
+                // ---------- 新连接 ----------
                 while (true) {
                     struct sockaddr_in client_addr{};
                     socklen_t client_len = sizeof(client_addr);
@@ -977,7 +851,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // ---------- 分机：有数据 / 对端关了 ----------
+            // ---------- 连接：有数据 / 对端关了 ----------
 
             // 这条连接正在工人手里 → 主线程不许碰（也别 read）
             if (ctxBusy(fd)) continue;

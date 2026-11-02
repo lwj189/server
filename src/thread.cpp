@@ -2,38 +2,17 @@
 // thread.cpp：单 Reactor + 线程池
 //
 // 和 epoll.cpp 的唯一区别是【谁来干活】：
+//   epoll.cpp   主线程：收连接 → 读 → 解析 → 算业务 → 发响应（全程一个线程）
+//   thread.cpp  主线程：收连接 → 读 → 解析；算业务、发响应交给线程池
+//   主线程不能为了"算一个请求"停下来 —— 它一停，所有别的连接都得等。
+// ⚠ 收益只在业务真吃 CPU 时存在：业务只返回一个固定字符串的话，队列 + 锁 + 唤醒的
+//   开销反而让吞吐更低。所以本文件带了一个真吃 CPU 的路由 /work?n=N（对照数据见 notes/）。
 //
-//   epoll.cpp       主线程：收连接 → 读 → 解析 → 算业务 → 发响应   （全程一个线程）
-//   thread.cpp 主线程：收连接 → 读 → 解析 ──┐
-//                                              └→ 线程池：算业务 → 发响应
-//
-// 为什么要这么拆？
-//   IO 和 CPU 是两件事。主线程不该为了"算一个请求"停下来 ——
-//   它一停，所有别的连接都得等。把计算丢给工人，主线程立刻回去照看别的连接。
-//
-//   ⚠ 但这个收益【只在业务真的吃 CPU 时才存在】。如果业务就是返回一个固定
-//     字符串，那线程池只会带来队列 + 锁 + 唤醒的开销，吞吐反而更低。
-//     所以本文件带了一个真的吃 CPU 的路由：/work?n=NNNN
-//     —— 用它才能把"线程池有用"这件事测出来。（对照数据见 notes/）
-//
-// fd 的交接协议（这是本文件最需要小心的地方）：
-//   主线程解析出完整请求后：
-//     ① setBusy(fd, true)    标记"这条连接现在归工人管"（走锁，别裸写字段）
-//     ② EPOLL_CTL_DEL        从 epoll 摘掉 —— 否则 LT 模式下它会继续通知主线程，
-//                            主线程就会和工人同时操作同一个 fd（数据竞争）
-//     ③ pool.submit(...)     把 (fd, 请求) 打包丢进队列
-//   工人干完：
-//     ④ send 响应
-//     ⑤ 要关就 close + erase；要留就 ctx.busy = false + EPOLL_CTL_ADD 还回去
-//
-//   ★ 第 ⑤ 步的"还回去"是本文件比 day5 参考实现多出来的一步 ——
-//     没有它，keep-alive 就没了（一条连接只能服务一个请求）。
-//
-// 编译运行（-pthread 必须加）：
-//     g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread.cpp -o thread -pthread
-//     ./thread                       # 4 个工人 + 每请求日志
-//     ./thread --workers 1           # 只开 1 个工人（用来证明"多核真的有用"）
-//     ./thread --quiet               # 关掉每请求日志（压测时用）
+// fd 交接协议：① setBusy(fd,true) ② EPOLL_CTL_DEL（不摘则 LT 继续通知主线程，和工人抢同一个 fd）
+//   ③ pool.submit；工人收尾：send → 要关就 erase+close，要留就 busy=false + EPOLL_CTL_ADD。
+//   ★ 这个"还回去"比 day5 参考实现多一步 —— 没有它 keep-alive 就没了（一条连接只服务一个请求）。
+// 编译运行（-pthread 必须加）：g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread.cpp -o thread -pthread
+//   ./thread [--workers N] [--port N] [--quiet]    # --workers 1 用来证明多核真的有用
 // ===========================================================================
 
 #include "http.hpp"          // ClientContext / parseRequest / buildResponse / logLine
@@ -66,15 +45,9 @@ constexpr unsigned long long MAX_WORK_UNITS = 20'000'000ULL;
 constexpr unsigned long long DEFAULT_WORK_UNITS = 200'000ULL;
 
 // ===========================================================================
-// 跨线程共享的东西
-//
-// ⚠ 这个文件里【唯一】需要保护的是 g_clients 这张表：
-//     · 主线程会 emplace（新连接）/ erase（连接结束）
-//     · 工人在还得回去的时候要改 ctx.busy
-//   两张线程都会碰 → 必须有一把锁。
-//
-//   为什么不在读/写 inbuf 时也加锁：因为 fd 交出去之前已经 EPOLL_CTL_DEL 了，
-//   主线程不会再收到这条连接的事件，也就不会再碰它的 inbuf —— 分工是清楚的。
+// 跨线程共享：这个文件里【唯一】需要保护的是 g_clients 这张表
+//   · 主线程 emplace（新连接）/ erase（连接结束）；工人还 fd 时要改 ctx.busy
+//   · 读写 inbuf 不用加锁：fd 交出去之前已经 EPOLL_CTL_DEL，主线程不会再碰它
 // ===========================================================================
 static ThreadPool* g_pool = nullptr;
 static int g_epoll_fd = -1;
@@ -82,10 +55,8 @@ static std::mutex g_clients_mutex;
 static std::unordered_map<int, ClientContext> g_clients;
 
 // ===========================================================================
-// 业务：真的吃 CPU
-//
-// xorshift64 —— 每一步都用上一步的结果，所以编译器【没法】把它优化掉。
-// 如果写成"空循环 n 次"，-O2 会直接把整个循环删掉，那测出来的就是假的。
+// 业务：真的吃 CPU。xorshift64 每一步都用上一步的结果，编译器【没法】把它优化掉；
+// 写成"空循环 n 次"的话 -O2 会直接删掉整个循环，测出来的 CPU 是假的。
 // ===========================================================================
 static uint64_t burnCpu(unsigned long long n) {
     uint64_t x = 0x9e3779b97f4a7c15ULL;   // 随便一个非零种子
@@ -107,15 +78,12 @@ static std::string requestTarget(const std::string& raw) {
     return raw.substr(sp1 + 1, sp2 - sp1 - 1);
 }
 
-// 从请求目标里切出 path（问号之前的那一段）：
-//     "/work?n=100" -> "/work"
-//     "/worker"     -> "/worker"
+// 从请求目标里切出 path（问号之前的那一段）："/work?n=100" -> "/work"
 //
-// ⚠ 为什么必须切开、再拿【整串】比：原来这里是
-//       if (target.rfind("/work", 0) != 0)      // 前缀匹配
-//   它把 "/worker" / "/workshop" 也当成 /work 吃了 —— 一个和业务毫无关系的路径，
-//   只要起手是这五个字符，就能让服务器去烧 CPU（白送一个 DoS 面）。
-//   判据：curl localhost:8888/worker 会拿到 "CPU work done"。
+// ⚠ 必须切开、再拿【整串】比，不能前缀匹配：原来的
+//       if (target.rfind("/work", 0) != 0)
+//   把 "/worker" / "/workshop" 也当成 /work 吃了 —— 和业务毫无关系的路径，只要起手是这
+//   五个字符就能让服务器烧 CPU（白送一个 DoS 面）。判据：curl localhost:8888/worker 会拿到 "CPU work done"。
 static std::string pathOf(const std::string& target) {
     const size_t q = target.find('?');
     return target.substr(0, q == std::string::npos ? target.size() : q);
@@ -123,9 +91,8 @@ static std::string pathOf(const std::string& target) {
 
 // 从 query 串（"n=100" / "a=1&n=100"）里取出 n；没有就用默认值，超上限截到上限
 //
-// ⚠ 为什么按 & 切参数、而不是直接在 target 里 find("n=")：
-//   "?foo=n=5" 里也含 "n=" —— 直接 find 会把它当成 n=5。
-//   按参数边界找，只有"整个参数名恰好是 n"才算数。
+// ⚠ 必须按 & 切参数边界找，不能直接在 target 里 find("n=")："?foo=n=5" 里也含 "n="，
+//   会被当成 n=5。按边界找，只有"整个参数名恰好是 n"才算数。
 static unsigned long long workUnits(const std::string& query) {
     size_t pos = 0;
     while (pos < query.size()) {
@@ -153,8 +120,7 @@ static std::string doBusiness(const std::string& raw) {
     const std::string path = pathOf(target);
 
     if (path != "/work") {
-        // 普通请求：和 epoll.cpp 返回完全一样的东西
-        // （这样 p2_test.py 那 23 项协议测试对两个服务器都成立）
+        // 普通请求：和 epoll.cpp 返回完全一样（p2_test.py 那 23 项协议测试对两个服务器都成立）
         return "<h1>Hello from my own server!</h1>";
     }
 
@@ -202,34 +168,24 @@ static void setBusy(int fd, bool busy) {
 // ⚠⚠ 本文件最要命的一条规矩：收连接时必须【先 eraseCtx，再 close】
 //
 // 反过来写会怎样（实测踩到过，而且是哨兵先喊出来的）：
-//
-//     工人： close(fd=5)          ← 号码 5 立刻可以被内核复用
-//     主线程：accept(...) 拿到 fd=5 → g_clients.emplace(5) 失败
-//             → 哨兵喊"账本里已经有 fd=5 —— 上一个连接漏了 erase"  ← 冤枉！
-//     工人： eraseCtx(5)          ← 把【新连接】的账销掉了
-//
-//   结果是：新连接不在账本里 → 主线程 findCtx 返回 nullptr → continue
-//   → 那条连接【再也没人读、没人关】，fd 一直泄漏。
-//
-//   顺序调过来就没事：eraseCtx 先做，等 close 真正释放号码时，
-//   账本里已经没有它了 —— 所以 close 之后复用这个号码的新连接一定能 emplace 成功。
-//
-//   一句话：**fd 是会被复用的号码，所以"销账"必须发生在"归还号码"之前。**
+//     工人 close(fd=5) → 号码 5 立刻可被内核复用 → 主线程 accept 又拿到 fd=5，
+//     emplace 失败 → 哨兵喊"账本里已经有 fd=5，上一个连接漏了 erase"（冤枉）；
+//     接着工人 eraseCtx(5) 把【新连接】的账销掉 → 新连接不在账本里 → findCtx 返回
+//     nullptr → 再也没人读、没人关，fd 一直泄漏。
+// 顺序调过来就没事：eraseCtx 先做，close 真正释放号码时账本里已经没有它了，
+// 所以 close 之后复用这个号码的新连接一定能 emplace 成功。
+// 一句话：fd 是会被复用的号码，"销账"必须发生在"归还号码"之前。
 // ===========================================================================
 
 // 工人处理【一个】已经解析出来的请求。返回 false = 这条连接已经收掉了。
 //
-// ⚠ 这里原来有个真 bug：send 失败只 perror 一句，然后 want_close==false 时
-//   照样把 fd 还回去。可 send 返回 -1 意味着【这条连接已经断了】
-//   （SIGPIPE 被忽略时是 EPIPE；对端发 RST 是 ECONNRESET）。还回去的结果：
-//     · 主线程捧着一条死连接，等一个永远不会再来的 EPOLLIN；
-//     · 断线永远没人回收 → fd 泄漏 → 最后撞 EMFILE。
-//   正确做法：send 失败 = 这条连接没救了，当场收掉（销账 + close）。
-//
-//   还有 sent < size 的【部分写】：非阻塞 fd 上这是真实存在的（大响应 + 慢客户端）。
-//   本实现没有输出缓冲 + EPOLLOUT，所以部分写也一并按"收掉"处理 ——
-//   宁可丢一个响应，也不能留下一条状态对不上的连接。
-//   （要真正支持部分写，得给每条连接加 outbuf、注册 EPOLLOUT，那是下一步的事。）
+// ⚠ 这里原来有个真 bug：send 失败只 perror 一句，want_close==false 时照样把 fd 还回去。
+//   可 send 返回 -1 意味着【这条连接已经断了】（SIGPIPE 被忽略时是 EPIPE，对端发 RST 是
+//   ECONNRESET）—— 还回去 = 主线程捧着一条死连接等一个永远不会再来的 EPOLLIN，
+//   断线永远没人回收 → fd 泄漏 → 最后撞 EMFILE。正确做法：send 失败 = 当场收掉。
+//   sent < size 的【部分写】在非阻塞 fd 上是真实存在的（大响应 + 慢客户端），本实现没有
+//   输出缓冲 + EPOLLOUT，所以部分写也一并按"收掉"处理 —— 宁可丢一个响应，也不留一条
+//   状态对不上的连接（要真正支持部分写，得给每条连接加 outbuf、注册 EPOLLOUT）。
 static bool workerHandleOne(int fd, const std::string& raw, bool want_close) {
     const std::string body = doBusiness(raw);
     const std::string response = buildResponse(body, want_close);
@@ -261,15 +217,13 @@ static bool workerHandleOne(int fd, const std::string& raw, bool want_close) {
 // ===========================================================================
 // 【工人线程】算业务 → 发响应 → 把 fd 还回去（或收掉）
 //
-// 注意参数全是【按值】捕获的：fd / 请求文本 / 要不要关。
-// 不能传 ClientContext 的引用 —— 那条连接的上下文归主线程管，
-// 工人只在需要碰 inbuf / busy 时短暂地进去改一下（而且要拿锁）。
+// 参数全是【按值】捕获的（fd / 请求文本 / 要不要关）：那条连接的上下文归主线程管，
+// 工人只在需要碰 inbuf / busy 时短暂进去改一下，而且要拿锁。
 //
-// ★ 中间那个 while 是踩出来的，不是想出来的：
-//   客户端可能一次发了两个请求（粘包）。主线程只解析出第一个就交出来了，
-//   第二个还在 ctx.inbuf 里 —— 而那是【用户态】缓冲区，不在内核里。
-//   所以就算把 fd 还回去，epoll 也不会报 EPOLLIN（内核没有新数据），
-//   第二个请求就永远没人管了（判据：keepalive_test 的 [2]，第一版就是挂在这）。
+// ★ 中间那个 while 是踩出来的，不是想出来的：客户端可能一次发了两个请求（粘包），主线程
+//   只解析出第一个就交出来了，第二个还在 ctx.inbuf 里 —— 而那是【用户态】缓冲区，不在
+//   内核里。所以就算把 fd 还回去，epoll 也不会报 EPOLLIN（内核没有新数据），第二个请求就
+//   永远没人管了（判据：keepalive_test 的 [2]，第一版就是挂在这）。
 //   → 工人必须【自己】把 inbuf 里排队的请求处理干净，再还 fd。
 // ===========================================================================
 static void handleInPool(int fd, std::string raw, bool want_close) {
@@ -314,10 +268,9 @@ static void handleInPool(int fd, std::string raw, bool want_close) {
     ev.events = EPOLLIN;
     ev.data.fd = fd;
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        // ⚠ 这里原来也只 perror 一句就完了 —— 那是【双泄漏】：
-        //     ADD 失败 = 主线程从此收不到这条连接的事件 = 这条连接没人管了；
-        //     而 fd 还开着、账本条目也还在 → fd 和内存同时漏。
-        //   epoll 实例满（ENOSPC）或 fd 已在别的 epoll 里（EEXIST）都会走到这。
+        // ⚠ 这里原来也只 perror 一句就完了 —— 那是【双泄漏】：ADD 失败 = 主线程从此收不到
+        //   这条连接的事件 = 没人管了；而 fd 还开着、账本条目也还在 → fd 和内存同时漏。
+        //   epoll 实例满（ENOSPC）或 fd 已在别的 epoll 里（EEXIST）都会走到这 ——
         //   既然没人再看得见它，只有一种收场：销账 + close。
         perror("epoll_ctl: ADD back");
         eraseCtx(fd);
@@ -325,9 +278,7 @@ static void handleInPool(int fd, std::string raw, bool want_close) {
     }
 }
 
-// ===========================================================================
-// 【主线程】把一个完整请求交给线程池
-// ===========================================================================
+// ---- 【主线程】把一个完整请求交给线程池 ----
 static void handOffToPool(ClientContext& ctx, size_t total) {
     const std::string raw = ctx.inbuf.substr(0, total);
     const bool want_close = ctx.want_close;
@@ -337,18 +288,13 @@ static void handOffToPool(ClientContext& ctx, size_t total) {
     }
 
     // ① 标记 + 消费字节（inbuf 归主线程管，趁现在处理干净）
-    //
-    // ⚠ 原来这里是 ctx.busy = true，直接写字段 —— 这是本文件里【唯一】一处
-    //   不经过锁就动 ctx 的地方。busy 是跨线程字段（工人/主线程都读它），
-    //   这里裸写又没有同步，等于把"这条连接归谁"这件事实交给了编译器和 CPU 的重排。
-    //   统一走 setBusy()：同一把锁进、同一把锁出，读和写看到的是同一个值。
+    // ⚠ 原来是 ctx.busy = true 直接裸写字段 —— busy 是跨线程字段，裸写没有同步，等于把
+    //   "这条连接归谁"交给了编译器和 CPU 的重排。统一走 setBusy()：同一把锁进、同一把锁出。
     setBusy(ctx.fd, true);
     ctx.inbuf.erase(0, total);
 
     // ② 从 epoll 摘掉 —— 不摘的话 LT 会继续通知主线程，两边同时操作同一个 fd
-    //   参数传 nullptr：man 2 epoll_ctl 明说 EPOLL_CTL_DEL 时 event 参数【会被内核忽略】
-    //   （Linux 2.6.9 之后允许传 NULL）。epoll.cpp 那边传的是 &ev ——
-    //   同一件事两种写法，读代码时容易以为是两个不同的语义。现在统一成 nullptr。
+    //   传 nullptr：EPOLL_CTL_DEL 时 event 参数【会被内核忽略】（Linux 2.6.9 起允许 NULL）。
     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx.fd, nullptr);
 
     // ③ 丢进队列（按值捕获，别传引用）
@@ -358,13 +304,9 @@ static void handOffToPool(ClientContext& ctx, size_t total) {
 
 // ===========================================================================
 // 命令行参数：把字符串读成无符号整数，失败【不抛异常】
-//
-// ⚠ 原来用的是 std::stoul，三个坑全在：
-//     · "abc"  → 抛 std::invalid_argument，没人接 → std::terminate → 直接崩；
-//     · "-1"   → stoul 会【静默接受】负号并回绕成 18446744073709551615（见 man）；
-//     · "12x"  → 返回 12，尾巴的 "x" 被无声吞掉。
-//   全是"用户手滑多打一个字符，服务器崩了 / 配了个荒唐值"。
-//   改成 strtoull + 全串校验：整串必须都是数字、不溢出、范围再由调用方卡。
+// ⚠ 原来用 std::stoul，三个坑全在："abc" 抛 std::invalid_argument 没人接 → terminate 直接崩；
+//   "-1" 被静默回绕成 18446744073709551615；"12x" 返回 12，尾巴的 x 被无声吞掉。
+//   改成 strtoull + 全串校验：整串必须都是数字、不溢出，范围再由调用方卡。
 // ===========================================================================
 static bool parseUnsigned(const char* s, unsigned long long& out) {
     if (s == nullptr || *s == '\0' || *s == '-') return false;   // 空串 / 负号都不收
@@ -528,10 +470,9 @@ int main(int argc, char** argv) {
                         dup = !g_clients.emplace(conn_fd, ctx).second;
                     }
                     if (dup) {
-                        // ⚠ 原来是"打一行日志，然后拿这条新连接当正常的用"。
-                        //   可账本里那条【旧】条目还占着这个号码 —— 主线程之后 findCtx(fd)
-                        //   拿到的是【旧连接】的 ctx（inbuf / want_close / busy 全是它的）。
-                        //   结果：新连接的数据被写进旧连接的缓冲，旧连接的关闭状态被套到新连接上。
+                        // ⚠ 原来是"打一行日志，然后拿这条新连接当正常的用"。可账本里那条【旧】
+                        //   条目还占着这个号码 —— 主线程之后 findCtx(fd) 拿到的是旧连接的 ctx
+                        //   （inbuf / want_close / busy 全是它的），新连接的数据被写进旧缓冲。
                         //   哨兵既然已经喊出"漏了 erase"，这条连接就该当毒药处理 —— 当场关掉。
                         logLine("账本里已经有 fd=" + std::to_string(conn_fd) +
                                 " —— 上一个连接漏了 erase，丢弃这条新连接");
@@ -557,8 +498,7 @@ int main(int argc, char** argv) {
                     if (n > 0) {
                         ctx->inbuf.append(buf, static_cast<size_t>(n));
 
-                        // 一个连接可能一次到好几个请求 → 循环解析
-                        // 但每交出去一个就得停：这条连接已经归工人了，别再动它
+                        // 一个连接可能一次到好几个请求 → 循环解析；但每交出去一个就得停
                         while (true) {
                             const ParsedRequest pr = parseRequest(*ctx);
                             if (pr.result == ParseResult::NeedMore) break;

@@ -42,8 +42,23 @@ static bool tryHandleRequest(ClientContext& ctx) {
     const std::string body = "<h1>Hello from my own server!</h1>";
     const std::string response = buildResponse(body, ctx.want_close);
 
-    if (send(ctx.fd, response.c_str(), response.size(), 0) < 0) {
-        perror("send");
+    // 非阻塞 fd 上 send 可能只写进去一部分。没有输出缓冲和 EPOLLOUT，
+    // 剩下的字节没人保管，这条连接就不能再复用；标记 want_close，
+    // 由调用方统一 close + 销账。一次发完才是正常路径。
+    size_t off = 0;
+    while (off < response.size()) {
+        const ssize_t n = send(ctx.fd, response.c_str() + off, response.size() - off, 0);
+        if (n > 0) {
+            off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;   // 被信号打断，这次没发出去，重来
+        }
+        logLine("send 未发完 fd=" + std::to_string(ctx.fd) +
+                "（无输出缓冲）—— 收掉连接");
+        ctx.want_close = true;
+        break;
     }
 
     // 必须消费已处理掉的字节。不删的话下次进来又找到同一个请求、再回一遍，

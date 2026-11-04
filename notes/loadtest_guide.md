@@ -1,7 +1,7 @@
 # 压测方法（Load Testing）—— 查阅型
 
 > **这份文件只讲"方法"**：测什么 / 怎么设计 / 怎么看结果 / 同时观察什么。
-> **压测数字**：旧数据已于 2026-11-04 删除（待重跑），这里只留方法论。
+> **压测数字**：2026-11-04 已在本机重跑，数据与口径见 `notes/stress.md`；这里只留方法论。
 >
 > 工具链三件套：`tests/load_test.sh`（驱动）→ `tests/analyze.sh`（出统计表）
 > → `tests/http_load.jmx`（JMeter 计划模板）。
@@ -58,7 +58,7 @@
 
 **拐点的读法**：`p2`（阻塞 + `backlog=3`）的旧压测里，拐点表现为
 `max` 从毫秒级飙到接近整数秒、错误类型全是 `ConnectTimeoutException`
-→ 罪魁祸首是 `backlog=3`。数字待重跑后补。
+→ 罪魁祸首是 `backlog=3`。2026-11-04 重跑确认：p2 在 100/200 并发分别 26/93 个 `ConnectTimeoutException`；epoll/thread（backlog=4096）到 400 并发 0 失败。
 
 ---
 
@@ -339,7 +339,7 @@ grep -E 'reset|Broken|perror' tests/results/srv.log
 
 ## 九、本项目基线
 
-⏳ 旧压测数字已于 2026-11-04 删除，重跑后补回。这里先留"怎么读"：
+2026-11-04 已在本机重跑（完整数据见 `notes/stress.md`）；这里只留"怎么读"：
 
 | 版本 | 看什么 | 怎么判 |
 | --- | --- | --- |

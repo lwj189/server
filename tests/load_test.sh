@@ -7,6 +7,8 @@
 #   ./tests/load_test.sh 200 500                 # 只跑一档：200 并发 × 500 次
 #   LEVELS="1:500 20:300 100:200" ./tests/load_test.sh   # 自定义阶梯
 #   PORT=9999 ./tests/load_test.sh               # 换端口（要和 p2.cpp 里的 PORT 一致）
+#   SRV_ARGS="--workers 4" HTTP_PATH="/work?n=2000000" \
+#     BIN=build/thread SRC=src/thread.cpp TAG=w4- KEEPALIVE=true ./tests/load_test.sh
 #
 # 它做五件事：
 #   1. 严格编译 p2.cpp（有警告就停）
@@ -40,6 +42,8 @@ BIN="${BIN:-build/p2}"
 CXXFLAGS="${CXXFLAGS:--std=c++17 -Wall -Wextra -Wformat=2 -Wconversion -pthread}"
 KEEPALIVE="${KEEPALIVE:-false}"                # 透传给 .jmx 的 -Jkeepalive
 TAG="${TAG:-}"                                 # 结果文件名前缀，避免不同服务器/配置互相覆盖
+SRV_ARGS="${SRV_ARGS:-}"                       # 服务器启动参数（如 "--workers 4"）；故意不加引号
+HTTP_PATH="${HTTP_PATH:-/}"                    # 被压的路径（如 "/work?n=2000000"）
 
 # 阶梯格式：并发:循环次数
 if [ $# -eq 2 ]; then
@@ -72,8 +76,9 @@ fi
 echo "    ✓ 编译通过（零错误零警告）"
 
 # ---------------- 2. 启动服务器 ----------------
-echo "==> 启动服务器 $BIN（端口 $PORT，keepalive=$KEEPALIVE）..."
-"$BIN" > "$OUTDIR/srv.log" 2>&1 &
+echo "==> 启动服务器 $BIN $SRV_ARGS（端口 $PORT，keepalive=$KEEPALIVE，path=$HTTP_PATH）..."
+# shellcheck disable=SC2086  # $SRV_ARGS 要按空格拆成多个参数
+"$BIN" $SRV_ARGS > "$OUTDIR/srv.log" 2>&1 &
 SRV_PID=$!
 
 cleanup() {
@@ -109,7 +114,7 @@ for lv in $LEVELS; do
     echo -n "    ${THREADS} 并发 × ${LOOPS} 次 ... "
     # -j：把 JMeter 自己的日志收进 results/，否则会落在当前目录
     "$JMETER" -n -j "$OUTDIR/$LABEL.jmeter.log" -t "$PLAN" -l "$JTL" \
-              -Jhost=127.0.0.1 -Jport="$PORT" \
+              -Jhost=127.0.0.1 -Jport="$PORT" -Jpath="$HTTP_PATH" \
               -Jthreads="$THREADS" -Jloops="$LOOPS" -Jrampup="$RAMPUP" \
               -Jkeepalive="$KEEPALIVE" \
               > /dev/null 2>&1

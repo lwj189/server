@@ -62,6 +62,11 @@ build/p2
 # 终端2：
 python3 tests/p2_test.py                 # 默认 127.0.0.1:8888
 python3 tests/p2_test.py --port 9999
+
+# 边界行为（自己起服务器：分片发送 / 半关闭 / 慢连接隔离 / 流水线部分写）
+python3 tests/edge_test.py --bin build/epoll
+python3 tests/edge_test.py --bin build/thread
+python3 tests/edge_test.py --bin build/thread_uev
 ```
 
 覆盖 5 个用例：
@@ -87,12 +92,23 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 `load_test.sh` 会严格编译（有警告就停）、启动服务器、逐档跑 JMeter，再调用 `analyze.sh` 出分析表，结果落在 `tests/results/`。
 
-#### 实测数据（旧数据已删除，待重跑）
+#### 实测数据（2026-11-04 重跑，当前 HEAD）
 
-⏳ **2026-11-04：之前所有压测数字已删除。** 原因：那批数据是 2026-10-04 在旧代码上测的，
-线程池版从未留下原始 `.jtl`；没有可复现依据的数字，不写进 README，更不能写进简历。
-重跑方法见上面的 `load_test.sh` 与 `notes/loadtest_guide.md`（第十节是记录模板）；
-新数据出来后再补表，并用同一把尺子（`tests/analyze.sh`）比较。
+同机压测：4 vCPU i7-13700HX / 15 GiB / `127.0.0.1`，JMeter 5.6.3 与服务器抢 CPU。
+完整口径、两轮区间、原始 `.jtl` 文件名见 **`notes/stress.md`**。只列关键档（未注明即 0 失败）：
+
+| 场景 | 并发 | 吞吐 req/s | 说明 |
+| --- | --- | --- | --- |
+| p2（close，backlog 3） | 100 | 3,327 | 26/20,000 失败（ConnectTimeout） |
+| epoll（close） | 100 | 8,234 | 0 失败；p2 → epoll 2.5× |
+| epoll（keep-alive） | 100 | 12,399~12,995 | 比 close +51%~58% |
+| epoll（keep-alive） | 400 | 16,149~16,992 | 80,000 请求 / 750 条连接 |
+| thread 4 工人（keep-alive） | 400 | 20,351~20,964 | 同档比 epoll 高约 20% |
+| thread `/work` 1 工人 | 4×500 | 83~84 | ~1.0 核 |
+| thread `/work` 4 工人 | 4×500 | 197~215 | ~2.8 核；约 2.5× |
+
+⚠ 同机压测时 JMeter 与服务器抢 4 个 vCPU，400 并发可能是客户端先饱和；这些数字用于**同环境对比**，
+不要和旧数据或其他机器横比。旧记录 79→262（3.3×）在本机未复现，原因见 `notes/stress.md` 4.2 节。
 
 
 ## 已知限制（哪些已修、哪些还没修）
@@ -101,12 +117,12 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 | --- | --- | --- | --- |
 | 1 | **一次 `read` ≠ 一个完整请求** | 客户端分片发送时，服务器会基于不完整的请求就响应 | ✅ CP5 已修（`inbuf` + 定界） |
 | 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
-| 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 keep-alive 之后**只剩这一处**（待重跑确认） |
+| 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 已确认：p2 100/200 并发 26/93 个 ConnectTimeout；epoll/thread（4096）到 400 并发 0 失败 |
 | 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`src/epoll.cpp`） |
 | 5 | `send` 未处理部分写 | 响应很大 + 慢客户端时可能发不完整 | ✅ `thread.cpp` / `thread_uev.cpp` 已加全量校验（`EINTR` 重试；部分写一律按"收掉这条连接"处理）。真正支持要加输出缓冲 + `EPOLLOUT`，暂未做 |
 | 6 | 没有优雅退出 | `SIGTERM` 直接死，在途请求丢 | ✅ `src/thread_uev.cpp` 已修（`signalfd` 统一事件源 + `drain()` 线程池 + 关空闲连接） |
 | 7 | 没有日志系统 | 只有 `std::cout` + 一把锁 | ⬜ 后续 |
-| 8 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 未验证的猜想：它可能正在压着吞吐上限。要验证就造一个"关掉日志"的变体对比 |
+| 8 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 已验证不是瓶颈：thread 开日志 vs `--quiet` 差异 <5%（197~215 vs 201~211 req/s） |
 
 ## 目录结构
 
@@ -121,8 +137,8 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   └── thread_pool.hpp         线程池类（只有一份，thread.cpp include 它）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
-├── notes/                      ← 笔记（6 份入库）
-├── tests/                      ← 测试（4 套 Python + 压测驱动）
+├── notes/                      ← 笔记（7 份入库）
+├── tests/                      ← 测试（5 套 Python，其中 4 套进 CI；另有压测驱动）
 ├── .github/workflows/ci.yml    CI：严格编译 + 跑 4 套测试
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
@@ -154,6 +170,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 - **`notes/epoll_notes.md`** —— epoll 技术专题
 - **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
 - **`notes/loadtest_guide.md`** —— 压测**方法**：测什么 / 六种类型 / 七条方法论 / 怎么看 `.jtl` / 同时观察什么
+- **`notes/stress.md`** —— 2026-11-04 重跑的**数据**：口径 / p2 / epoll / thread / 结论（和上一份的方法配套）
 
 ## 说明
 

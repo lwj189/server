@@ -1,8 +1,7 @@
 # 压测方法（Load Testing）—— 查阅型
 
 > **这份文件只讲"方法"**：测什么 / 怎么设计 / 怎么看结果 / 同时观察什么。
-> **具体数字在 `notes/stress.md`**（`p2` 阻塞版 + `epoll` keep-alive 两批数据）——
-> 同一件事不写两处：这里只留方法论，数字一律去 `stress.md` 查。
+> **压测数字**：旧数据已于 2026-11-04 删除（待重跑），这里只留方法论。
 >
 > 工具链三件套：`tests/load_test.sh`（驱动）→ `tests/analyze.sh`（出统计表）
 > → `tests/http_load.jmx`（JMeter 计划模板）。
@@ -57,9 +56,9 @@
 | ③ 平台期 | 吞吐到顶，再加压只涨延迟不涨吞吐 |
 | ④ 崩溃区 | 大量超时/拒绝、延迟爆炸 |
 
-**本项目实测到的拐点**：在 `p2`（阻塞 + `backlog=3`）上，拐点表现为
-`max` 从 19ms 飙到 2003ms、错误类型全是 `ConnectTimeoutException`
-→ 罪魁祸首是 `backlog=3`。完整数据见 `stress.md`。
+**拐点的读法**：`p2`（阻塞 + `backlog=3`）的旧压测里，拐点表现为
+`max` 从毫秒级飙到接近整数秒、错误类型全是 `ConnectTimeoutException`
+→ 罪魁祸首是 `backlog=3`。数字待重跑后补。
 
 ---
 
@@ -216,7 +215,7 @@ JMeter 不对 `boolProp` 里的 `${__P(...)}` 求值，`-Jkeepalive=true` 会**�
 ### 【方式 A】命令行 summary（最快）
 
 ```
-summary =  20000 in 00:00:05 = 4376.4/s Avg: 10 Min: 0 Max: 2003 Err: 2 (0.01%)
+summary =  20000 in 00:00:05 = 4000.0/s Avg: 10 Min: 0 Max: 2000 Err: 2 (0.01%)
            └样本数┘ └─总耗时─┘ └吞吐/s┘  └平均┘ └最小┘└最大┘ └失败数+比例┘
 ```
 
@@ -332,23 +331,25 @@ ps -o pid,stat,wchan:20,cmd -p $(pgrep epoll)
 grep -E 'reset|Broken|perror' tests/results/srv.log
 ```
 
-★ **延迟尖峰的读法**：`max = 1271ms / 2003ms` 这种"接近整数秒"的数字，
+★ **延迟尖峰的读法**：`max` 接近 1000ms / 2000ms 这种"接近整数秒"的数字，
 不是服务器慢，是 **accept 队列满 → 内核丢 SYN → 客户端按 TCP 退避重传（1s → 2s → 4s）**。
-`建连 p99` 那一列是判断这件事的关键（`stress.md` 里 epoll 把它压到了 0ms）。
+`建连 p99` 那一列是判断这件事的关键。
 
 ---
 
 ## 九、本项目基线
 
-**数字全部在 `notes/stress.md`**，这里只留"怎么读"：
+⏳ 旧压测数字已于 2026-11-04 删除，重跑后补回。这里先留"怎么读"：
 
-| 版本 | 关键现象 | 结论 |
+| 版本 | 看什么 | 怎么判 |
 | --- | --- | --- |
-| `p2`（阻塞 + `backlog=3`） | `Recv-Q` 顶到 3~4；错误全是 `ConnectTimeoutException`；`建连 p99` 1001ms | 瓶颈**不在处理能力**（p50=0ms），在 **accept 队列** + 单线程串行 |
-| `epoll`（事件驱动 + keep-alive） | `建连 p99` **0ms**；同样并发下吞吐 2.4×、错误少 12× | keep-alive 把"每请求一条连接"消掉 → 墙退远；**剩下的墙仍是 `backlog=3`**（只在爬坡瞬间咬人） |
+| `p2`（阻塞 + `backlog=3`） | `Recv-Q` 是否顶到 backlog、错误是否全是 `ConnectTimeoutException`、`建连 p99` 是否接近 1s / 2s | 瓶颈在 **accept 队列** + 单线程串行，不在处理能力 |
+| `epoll`（事件驱动 + keep-alive） | `建连 p99`、`TIME_WAIT`、连接数 | keep-alive 把"每请求一条连接"消掉；剩下的墙看 `backlog` |
 
-**下一步杠杆**：`listen(fd, backlog)` 与 `net.core.somaxconn`
-（`backlog=3` 是被这次压测**证实**的下一个瓶颈，不是猜的）。
+⚠ **两把尺子**：同一批 `.jtl`，JMeter summary 的吞吐和 `analyze.sh` 算的吞吐分母不同；
+比较只能用同一种尺子（本项目统一用 `analyze.sh`）。
+
+**下一步杠杆**：`listen(fd, backlog)` 与 `net.core.somaxconn`（重跑后验证）。
 
 ---
 
@@ -374,10 +375,9 @@ grep -E 'reset|Broken|perror' tests/results/srv.log
 ~/桌面/server/tests/load_test.sh            一键压测驱动（项目专用；可切服务器）
 ~/桌面/server/tests/analyze.sh              通用结果分析器（对任何 .jtl 都有效）
 ~/桌面/server/tests/results/                结果输出（.jtl + srv.log + .jmeter.log，已 gitignore）
-~/桌面/server/notes/stress.md               压测数字
 ~/桌面/server/notes/loadtest_guide.md       本文件（方法）
 
-被测服务器：~/桌面/server/p2.cpp（阻塞版）、~/桌面/server/epoll.cpp（事件驱动版）
+被测服务器：~/桌面/server/src/p2.cpp（阻塞版）、~/桌面/server/src/epoll.cpp（事件驱动版）
 ```
 
 （已删除：`~/桌面/loadtest-8888.jmx`、`tests/p2_load.jmx`、`tests/test_client.py`

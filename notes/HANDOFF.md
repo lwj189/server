@@ -137,7 +137,6 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 │   ├── epoll_notes.md      ← epoll 专题：API + 概念 + 坑 + 速查表（CP6a ~ CP6d）
 │   ├── pitfalls.md         ← 【全部踩坑】CP1~CP6d + 元教训（心得）。坑只有这一个家
 │   ├── selfcheck.md        ← 自检 69 题【题 + 答案】（先自己答，再往下翻）
-│   ├── stress.md           ← 压测【数字】：p2（阻塞）+ epoll（keep-alive）两批
 │   └── loadtest_guide.md   ← 压测【方法】：测什么 / 怎么设计 / 怎么看 / 观察什么
 └── tests/
     ├── p2_test.py         ← 【正确性】23 项：正常/连上就关/RST/并发/半包/超长头/body 分片…
@@ -238,7 +237,7 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
    ⚠ 验收标准是 **`p2_test.py` 23/23 对着 `build/epoll` 跑** —— 搬迁前实测 0/23，现在 23/23
 ✅ CP6d-1 EMFILE 忙等：撞 fd 上限后**暂停接收**（`EPOLL_CTL_DEL`），腾出 fd 再恢复
 ✅ CP6d-2 keep-alive：一条连接服务多个请求（`want_close` + `inbuf.erase` + 循环解析）
-✅ 线程池版 `src/thread.cpp`（单 Reactor + 线程池；`/work` 吃 CPU 的业务实测 79 → 262 req/s）
+✅ 线程池版 `src/thread.cpp`（单 Reactor + 线程池；`/work` 吃 CPU 的业务有收益，数字待重跑）
 ✅ 统一事件源 `src/thread_uev.cpp`（signalfd 进 epoll + 优雅停机；SIGTERM 在途请求不丢）
 ▶  下一步 CP6d-3：部分写（`send` 返回 < n → 输出缓冲 + `EPOLLOUT`）
    ⚠ 现在**撞不到**（响应 117 字节 ≪ 发送缓冲区 16384）→ 按 TDD 规矩先不动

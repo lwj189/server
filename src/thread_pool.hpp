@@ -1,5 +1,5 @@
 // thread_pool.hpp -- 固定大小的线程池。
-// thread_pool.cpp 用它跑 demo，thread.cpp 用它接真服务器，同一个类只有一份。
+// thread.cpp 用它接真服务器，同一个类只有一份。
 // 用 std::thread，编译必须加 -pthread（不加能过编译，链接时报 undefined）。
 #pragma once
 

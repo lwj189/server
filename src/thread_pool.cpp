@@ -1,33 +1,21 @@
-// ===========================================================================
-// src/thread_pool.cpp：线程池【独立演示】
+// thread_pool.cpp -- 线程池独立演示：不接 socket，10 个任务丢给 4 个工人。
+//   g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion thread_pool.cpp -o thread_pool -pthread
+// 单独跑是因为在服务器里调试线程池很难受：任务和连接、fd、epoll 搅在一起，
+// 出了问题分不清是池子的锅还是服务器的锅。先用这个确认池子本身是好的。
 //
-// 不接服务器、没有 socket，就 10 个假任务丢进去，看它们怎么被 4 个工人分掉。
-// 为什么单独演示：线程池在服务器里极难调试 —— 任务和连接 / fd / epoll 搅在一起，出了问题
-// 分不清是池子的锅还是服务器的锅；先把池子单独跑通（创建 / 派活 / 优雅退出）再接进服务器。
-// ★ ThreadPool 类本身在 src/thread_pool.hpp 里（只有一份）：这个文件和 thread.cpp
-//   include 的是同一个类（以前这里抄了一份类定义，两份代码迟早漂移，已经改掉了）。
-// 编译运行（-pthread 必须加，否则链接报错）：g++ -std=c++17 src/thread_pool.cpp -o build/thread_pool -pthread && build/thread_pool
-// ===========================================================================
+// ThreadPool 类在 thread_pool.hpp 里，thread.cpp include 的是同一个类。
 
 #include "thread_pool.hpp"
 
-#include <chrono>    // std::chrono::milliseconds
-#include <iostream>  // std::cout / std::endl
+#include <chrono>
+#include <iostream>
 
-// ---------------------------------------------------------------------------
-// 用法演示：提交 10 个任务，看它们被 4 个线程怎么分
-// 观察点：
-//   · "任务 N 由线程 X 处理" 里的 X 会在 4 个不同值之间跳 —— 活被分掉了
-//   · 每个任务睡 200ms，10 个任务 4 个工人 → 总耗时约 600ms 而不是 2000ms
-//   · 主线程打印"都提交完了"之后就结束了，是 pool 的析构函数在等工人下班
-// ---------------------------------------------------------------------------
 int main() {
-    ThreadPool pool(4);   // 4 个工人
+    ThreadPool pool(4);
 
     for (int i = 1; i <= 10; ++i) {
-        // [i] 按【值】捕获：如果不捕获，任务跑到时 i 可能已经变成 11 了
+        // 按值捕获 i。按引用的话，任务真正跑到时 i 可能已经是 11 了。
         pool.submit([i] {
-            // 假装这个任务要干 200 毫秒
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             std::cout << "  任务 " << i << " 由线程 " << std::this_thread::get_id()
                       << " 处理" << std::endl;
@@ -35,6 +23,6 @@ int main() {
     }
 
     std::cout << "10 个任务都提交完了，主线程先歇着（不等结果）" << std::endl;
-    // main 走到这里就结束了 → pool 析构 → 自动等所有任务跑完
+    // main 返回后 pool 析构，在那里等所有任务跑完
     return 0;
 }

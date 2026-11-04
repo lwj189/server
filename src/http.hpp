@@ -1,82 +1,55 @@
-// ===========================================================================
-// http.hpp：HTTP 解析 / 响应构造 —— 与"用什么并发模型"无关的部分
-//
-// 项目里有两个服务器：epoll.cpp（单线程 Reactor，36 项测试守着它）和 thread.cpp
-// （单 Reactor + 线程池）。并发模型完全不同，但 HTTP 怎么解析、响应怎么拼一模一样 ——
-// 抄两份迟早漂移，所以抽到这个头文件。判断标准：这里所有东西都【不依赖 epoll，
-// 也不依赖线程】，输入一段字符串输出结果。
-// 注意 buildResponse 只负责"拼字符串"，不负责 send —— 谁发、什么时候发、发不完怎么办，
-// 由各自的并发模型决定。
-// ===========================================================================
+// http.hpp -- HTTP 协议层：解析请求、拼响应。不涉及 epoll，也不涉及线程。
+// epoll.cpp 和 thread.cpp 共用这一份。
+#pragma once
 
-#pragma once   // 同一个 .cpp 里 include 两次也只展开一次
+#include <cctype>
+#include <cstddef>
+#include <exception>
+#include <iostream>
+#include <mutex>
+#include <string>
 
-#include <cctype>     // std::tolower
-#include <cstddef>    // size_t
-#include <exception>  // std::exception（stoull 溢出时抛的那个）
-#include <iostream>   // std::cout / std::endl
-#include <mutex>      // std::mutex / std::lock_guard（多线程日志用）
-#include <string>     // std::string
-
-// ★【DoS 保护】请求头 / 请求体大小上限（和 p2.cpp 同一套值）
-//   没有上限的实现会被"一直发数据、永远不发 \r\n\r\n"的客户端吊死（内存涨爆）。
-//   MAX_HEADER_SIZE = 8 KB 与 nginx 的 large_client_header_buffers 同量级；MAX_BODY_SIZE = 1 MB 与 nginx client_max_body_size 默认值一致。
+// 头 / 体上限，防"只发头不发完"的连接把内存吊住。
 constexpr size_t MAX_HEADER_SIZE = 8 * 1024;
 constexpr size_t MAX_BODY_SIZE = 1024 * 1024;
 
-// ===========================================================================
-// 日志：多线程下必须"整行原子"
-//
-//   std::cout << a << b << c 是【三次】调用：两个线程同时写会交错成
-//   "新连接 fd=新连接 fd=57"，而 keepalive_test / balance_test 是按行读日志的，一乱就变成假红。
-//   ⚠ std::endl 会 flush：日志重定向到文件时测试才能及时读到，不能换成 '\n'。
-//
-// ⚠⚠ 这三个东西是 inline 而【不是】static（头文件里的陷阱）：static 在头文件里给的是
-//   【内部链接】—— 每个包含它的 .cpp 各得一份独立副本。现在 epoll.cpp / thread.cpp 是两个
-//   独立可执行文件，看着一切正常；一旦两个 .cpp 链进同一个程序（比如加个 main.cpp），就会
-//   变成两把【不同的】锁（logLine 的原子性当场失效）、两份【不同的】g_log_requests
-//   （--quiet 关了但日志还在）。inline 变量（C++17）保证【全程序只有一份】。
-// ===========================================================================
+// 日志必须整行原子：cout << a << b << c 是三次调用，两个线程同时写会交错成
+// "新连接 fd=新连接 fd=57"，而测试是按行读日志的。
+// 必须 inline（C++17）不能用 static：static 在头文件里是内部链接，两个 TU
+// 链进同一个程序会变成两把独立的锁、两份 g_log_requests。
 inline std::mutex g_log_mutex;
 
 inline void logLine(const std::string& line) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
-    std::cout << line << std::endl;
+    std::cout << line << std::endl;   // endl 要 flush，重定向到文件时测试才读得到
 }
 
-// 压测开关：每个请求都打日志（还带 flush）会成为瓶颈，thread.cpp 用 --quiet 关掉它。
-// [[maybe_unused]] 不能省：epoll.cpp 是单线程的、用不到这个开关，而 CI 是"有警告即失败"。
+// --quiet 关掉逐请求日志（压测用）。
+// [[maybe_unused]] 不能省：epoll.cpp 不用这个开关，而 CI 有警告即失败。
 [[maybe_unused]] inline bool g_log_requests = true;
 
-// ===========================================================================
-// 每条连接的状态。为什么不能只是一个 fd 号：要处理半包 / 粘包，就必须把"这条连接已经
-// 收到哪儿了"存下来，而事件处理完栈帧就没了 → 进度必须从栈上搬到外面的容器里。
-// ===========================================================================
+// 每条连接的状态。
+// 一次 read 可能只拿到半个请求，半个请求得存下来等下次事件 —— 所以缓冲区
+// 必须挂在连接对象上，不能是 read 函数的局部变量。
 struct ClientContext {
     int fd = -1;
 
-    // 每条连接自己的读缓冲区：TCP 是字节流，一次 read 可能只拿到半个请求，
-    // 剩下半个得先存着等下次事件拼起来 —— 栈上的局部变量活不到下一次事件。
+    // 这条连接自己的缓冲区。多条连接共用会互相污染。
     std::string inbuf;
 
-    // 这条连接【回完当前请求之后】要不要关？客户端在请求头里说（Connection: close）；
-    // 出错的连接也必须关（头过大 / Content-Length 非法 …），也是靠这个成员。
-    //     true = 该关了    false = 留着继续服务后面的请求（HTTP/1.1 的默认行为）
+    // 回完当前请求后要不要关：客户端要 close，或这条连接已被判非法。
     bool want_close = false;
 
-    // ---- 只在 thread.cpp（单 Reactor + 线程池）里用得到 ----
-    // true = 这条连接已经从 epoll 摘掉、正躺在工人手里。主线程看到 busy 就必须【完全别碰它】
-    // （不 read、不解析、不关），否则就是两个线程同时操作同一个 fd（数据竞争 / use-after-close）。
-    // epoll.cpp 是单线程的，这个字段永远是 false，不影响它任何行为。
+    // 只在 thread.cpp 用：true = fd 已从 epoll 摘掉、正在工人手里。
+    // 主线程看到 busy 就不能再碰这个 fd（不 read / 不解析 / 不 close），
+    // 否则就是两个线程操作同一个 fd。epoll.cpp 单线程，永远是 false。
     bool busy = false;
 };
 
-// ===========================================================================
-// 下面三个纯函数从 p2.cpp 原样搬来：不依赖 socket、不依赖 epoll，输入一段字符串输出解析结果
-// ===========================================================================
+// 以下三个纯函数从 p2.cpp 原样搬来，不依赖 socket 和 epoll。
 
-// 只转 ASCII 小写：HTTP 头字段名限定为 ASCII token，而且 std::tolower 的参数必须是
-// unsigned char 的值（负数进去是未定义行为）。
+// 只转 ASCII 小写。man 3 tolower 要求参数是 unsigned char 的值或 EOF，
+// 直接传 char（负数）是未定义行为。
 static std::string toLowerAscii(const std::string& s) {
     std::string out = s;
     for (char& c : out) {
@@ -85,9 +58,9 @@ static std::string toLowerAscii(const std::string& s) {
     return out;
 }
 
-// 在"头部区域"[0, header_end) 内查找字段 name，找到就返回值（已去掉两端空白）。
-// 三个协议细节：① 字段名大小写不敏感（RFC 9110 §5.1）② 冒号后的 OWS 可为 0 个（RFC 9112 §5）
-//              ③ 只在头部区域内找 —— 否则 body 里的同名文本会把解析器骗到
+// 在头部区域 [0, header_end) 内按字段名取值，返回时去掉两端空白。
+// 三处容易漏：字段名大小写不敏感；冒号后的 OWS 可以是 0 个；只能在这段
+// 区域内找 —— 否则 body 里的同名文本会被当成头字段。
 static bool findHeader(const std::string& buf, size_t header_end,
                        const std::string& name, std::string& value) {
     const std::string want = toLowerAscii(name);
@@ -117,8 +90,10 @@ static bool findHeader(const std::string& buf, size_t header_end,
     return false;
 }
 
-// 整个字符串都是十进制数字？（空串不算）
-// 为什么要它：std::stoull("10abc") 会返回 10，非法值被当成合法值接受了（RFC 9112 §6.3 要求 400）。
+// 整串都是十进制数字？（空串不算）
+// 不能用 stoull 代替：stoull("10abc") 返回 10，非法值会被当成合法值收下。
+// 也不用 std::isdigit：同样是负数入参的 UB；'0' <= c <= '9' 明确，且不受 locale 影响。
+// 这里的 for 没有 &，对比上面的 toLowerAscii：只读不改。
 static bool isAllDigits(const std::string& s) {
     if (s.empty()) return false;
     for (char c : s) {
@@ -127,43 +102,40 @@ static bool isAllDigits(const std::string& s) {
     return true;
 }
 
-// ===========================================================================
-// 解析：从 ctx.inbuf 里取出【一个完整请求】（p2.cpp 是一个 while 循环堵在那里读到收全为止；
-// 这里每次事件调用一次，不够就原地返回，进度留在 ctx.inbuf 里）
+// 从 ctx.inbuf 里取一个完整请求。每次 EPOLLIN 调一次，不够就原地返回，
+// 进度留在 ctx.inbuf 里（p2.cpp 那版是 while 循环堵到收全为止）。
 //
 // 三种结果，调用方必须区别对待：
-//   NeedMore —— 还不够一个完整请求，等下次事件（什么都不做）
-//   Ready    —— out.raw / out.total 有效，调用方去发响应 + 消费字节
-//   Rejected —— 请求非法（头过大 / Content-Length 非法…），ctx.want_close 已置 true；
-//               调用方【直接收掉连接，不要回任何东西】（和 p2.cpp 的行为一致）
-// ===========================================================================
+//   NeedMore  还不够一个请求，等下次事件
+//   Ready     out.raw / out.total 有效，去发响应并消费这些字节
+//   Rejected  请求非法，want_close 已置 true，直接收连接、不回任何东西
 enum class ParseResult { NeedMore, Ready, Rejected };
 
 struct ParsedRequest {
     ParseResult result = ParseResult::NeedMore;
-    std::string raw;     // Ready 时有效：完整请求文本（头部 + body）
-    size_t total = 0;    // Ready 时有效：这个请求一共占多少字节
+    std::string raw;     // Ready 时有效：完整请求（头部 + body）
+    size_t total = 0;    // Ready 时有效：这个请求占多少字节
 };
 
 static ParsedRequest parseRequest(ClientContext& ctx) {
     ParsedRequest out;
 
-    // ---- ① 头部定界：找 \r\n\r\n（RFC 9112 §2.1）----
+    // ① 头部定界 \r\n\r\n
     const size_t header_end = ctx.inbuf.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        // 头部还没收全。但别无限等 —— 对方可能永远不发定界符（DoS）。
-        // ⚠ 判断顺序：先看"收全没有"，再看"超限"；反过来会把"头很小但 body 很大"的合法请求误杀。
+    if (header_end == std::string::npos) {                  // 还没收全头部
+        // 对方可能永远不发定界符。判断顺序不能反：先看收全没有，再看超限 ——
+        // 反过来会把"头很小但 body 很大"的合法请求误杀。
         if (ctx.inbuf.size() > MAX_HEADER_SIZE) {
             logLine("请求头过大 —— 丢弃 fd=" + std::to_string(ctx.fd));
-            ctx.want_close = true;   // 判死刑的连接一律要关（下面 3 处错误分支同理）
+            ctx.want_close = true;   // 判死刑的连接一律要关
             out.result = ParseResult::Rejected;
             return out;
         }
         return out;   // NeedMore：等下次事件
     }
 
-    // ---- ② 解析 Content-Length（CP5 的三个坑由上面两个纯函数解决）----
-    size_t content_len = 0;   // 没有这个头字段就按 0 处理（普通 GET 就是这种）
+    // ② Content-Length
+    size_t content_len = 0;   // 没这个头字段就按 0 处理（普通 GET 就是这种）
     std::string cl_value;
     if (findHeader(ctx.inbuf, header_end, "Content-Length", cl_value)) {
         if (!isAllDigits(cl_value)) {
@@ -175,7 +147,7 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
         try {
             const unsigned long long v = std::stoull(cl_value);
             if (v > MAX_BODY_SIZE) {
-                // 也是 DoS 防护：声明一个巨大的 body 却不发，就能吊住服务器
+                // 声明一个巨大 body 却不发，同样能吊住服务器
                 logLine("body 过大（Content-Length=" + std::to_string(v) + "）—— 丢弃 fd=" +
                         std::to_string(ctx.fd));
                 ctx.want_close = true;
@@ -184,7 +156,7 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
             }
             content_len = static_cast<size_t>(v);
         } catch (const std::exception&) {
-            // 走到这里只可能是数字长得离谱（stoull 溢出）
+            // 只可能是数字长得离谱，stoull 溢出
             logLine("Content-Length 溢出 —— 丢弃 fd=" + std::to_string(ctx.fd));
             ctx.want_close = true;
             out.result = ParseResult::Rejected;
@@ -192,24 +164,18 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
         }
     }
 
-    // ---- 客户端要不要关连接？（HTTP/1.1 默认复用，客户端说 close 才关）----
-    // 位置讲究：必须在【拼响应之前】问出来，因为响应里的 Connection 头要跟着它走。
-    // ⚠ 和上面找 Content-Length 只有【前半截】像（都是 findHeader 取值），后半截完全不同：
-    //   那个要把数字串转成整数（isAllDigits / stoull / MAX_BODY_SIZE），这个只要比字符串 ——
-    //   照抄形状可以，抄进来的每一行都得知道在干嘛。
-    // 值可能是 "close" / "keep-alive" / "Close"… → 先 toLowerAscii 再比（RFC 9110 §5.1）
+    // ③ 客户端要不要关连接。必须在拼响应之前问出来，响应里的 Connection 头跟着它走。
+    // 这一段和上面找 Content-Length 只是形状像：那个要把数字转整数，这个只比字符串。
     std::string conn_value;
     if (findHeader(ctx.inbuf, header_end, "Connection", conn_value) &&
         toLowerAscii(conn_value) == "close") {
         ctx.want_close = true;
     }
 
-    // ---- ③ 一个完整请求 = 头部 + 结尾空行 + body，一共多少字节？----
-    //     header_end 指向 "\r\n\r\n" 的【第一个 \r】，头部内容本身不含这 4 个字节。
+    // ④ 一个完整请求 = 头部 + 结尾空行 + body。header_end 指向 "\r\n\r\n" 的第一个 \r。
     const size_t total = header_end + 4 + content_len;
 
-    // ---- ④ 收齐了没有？没齐就原地返回 —— 这一行就是"切片"：
-    //      函数退出，进度留在 ctx.inbuf 里，等下一个 EPOLLIN 再进来重新算一遍。
+    // 没齐就原地返回，进度留在 ctx.inbuf 里，下一个 EPOLLIN 进来重算
     if (ctx.inbuf.size() < total) {
         return out;   // NeedMore
     }
@@ -220,9 +186,7 @@ static ParsedRequest parseRequest(ClientContext& ctx) {
     return out;
 }
 
-// ===========================================================================
-// 拼 HTTP 响应（只拼字符串，不发）。want_close 决定 Connection 头：客户端说要关，我们也回 close。
-// ===========================================================================
+// 只拼字符串，不发。want_close 决定 Connection 头：客户端说要关，我们也回 close。
 static std::string buildResponse(const std::string& body, bool want_close) {
     const std::string conn_header = want_close ? "Connection: close\r\n"
                                                : "Connection: keep-alive\r\n";

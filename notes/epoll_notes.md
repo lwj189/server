@@ -41,7 +41,7 @@ $ ps -o pid,stat,pcpu,wchan:18,cmd -p <pid>
 | 正式名字 | — | **Reactor（反应器）** |
 
 > 注意：epoll 解决的是 **IO 等待**，不是**业务处理慢**。
-> 如果回调里做阻塞操作（sleep、慢查询），整个事件循环照样卡住 —— 那是 day5 线程池要解决的。
+> 如果回调里做阻塞操作（sleep、慢查询），整个事件循环照样卡住 —— 那是 day5 线程池要解决的（已做：`src/thread.cpp`）。
 
 ---
 
@@ -224,7 +224,7 @@ while (true) {
 | 2 | `accept` 只调**一次**（没循环到 EAGAIN） | 并发连接时漏掉一部分 | 循环 accept 到 `EAGAIN` |
 | 3 | `read` 只调**一次**（没循环到 EAGAIN） | 数据残留、半包处理错乱、ET 下丢事件 | 循环 read 到 `EAGAIN` |
 | 4 | `close(fd)` 后忘了 `clients.erase(fd)` | **新连接拿到同一个 fd 号 → 读到上一条连接的残留状态** | close 和 erase 永远配对 |
-| 5 | 在事件回调里做**阻塞操作** | 整个事件循环卡住，所有连接一起卡 | 慢业务交给线程池（day5） |
+| 5 | 在事件回调里做**阻塞操作** | 整个事件循环卡住，所有连接一起卡 | 慢业务交给线程池（day5，已做：`src/thread.cpp`） |
 | 6 | `close` 前不 `EPOLL_CTL_DEL` | fd 被复用后 epoll 里还挂着旧登记 → 诡异 bug | close 前先 DEL |
 
 > 坑 4 的实测证据：CP6a 里连续 3 次连接，服务器打印的 fd **全是 5** ——

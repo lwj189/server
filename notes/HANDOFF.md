@@ -20,7 +20,7 @@ python3 tests/p2_test.py                  #    跑测试（应为 23/23 通过�
 kill %1                                   #    收工
 
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp -o build/epoll   # ④ epoll 版也要过
-build/epoll &                                 #    ⚠ p2 和 epoll 都占 8888，不能同时开
+build/epoll &                                 #    ⚠ 四个服务器都占 8888，不能同时开
 python3 tests/p2_test.py                  #    ① 协议正确性（应为 23/23）
 python3 tests/balance_test.py --pid $! --log server.log   # ② 资源配平（应为 4/4）
 kill %1
@@ -33,6 +33,8 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 #   （它自己会校验"这个 pid 是不是 8888 的监听者"，对不上会拒绝跑并退出码 2）
 # 如果测试不通过，说明代码状态和这份笔记写的不一致 —— 先搞清楚差在哪，再往下做
 ```
+
+# ⑥ `thread` / `thread_uev` 用同一条命令编译（末尾加 -pthread），测试同样跑 p2_test + balance_test
 
 第 ③ 步很重要：**测试是不依赖记忆的那部分事实**。跑通就知道"什么是对的"。
 
@@ -120,12 +122,15 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 ```
 ~/桌面/server/
 ├── src/p2.cpp              ← 我手写的服务器（阻塞版），CP1~CP5，23 项测试全过
-├── src/epoll.cpp           ← 事件驱动的 HTTP 服务器（约 515 行）：CP6a~CP6c + CP6d-1/-2
-├── src/thread.cpp          ← 单 Reactor + 线程池版（主线程管 IO，工人算业务）
+├── src/epoll.cpp           ← 事件驱动的 HTTP 服务器（323 行 / 代码 194）：CP6a~CP6c + CP6d-1/-2
+├── src/thread.cpp          ← 单 Reactor + 线程池版（538 行 / 代码 317）：主线程管 IO，工人算业务
+├── src/thread_uev.cpp      ← thread + signalfd 统一事件源 + 优雅停机（923 行 / 代码 634）
+├── src/http.hpp            ← 三个手写服务器【共用】的 HTTP 逻辑
+├── src/thread_pool.hpp     ← 线程池类（thread.cpp 用它）
 ├── README.md
 ├── .clang-format       ← 代码风格（4 空格缩进 / Attach 括号 / 指针贴左 / 不折行）
-├── .github/workflows/ci.yml ← CI：严格编译 p2+epoll（有警告即失败），再跑 4 套测试
-│                              （23 + 23 + 4 串行；keepalive 7 + emfile 2 自起服务器）
+├── .github/workflows/ci.yml ← CI：严格编译 4 个目标（有警告即失败），再跑 4 套测试
+│                              （p2 23 / epoll 23+4 / thread 23+4 串行；keepalive 7 + emfile 2 自起服务器）
 ├── notes/
 │   ├── HANDOFF.md          ← 本文件（项目现状 + 路线 + 我踩过的坑）
 │   ├── learning_progress.md ← 进度：各 CP 小节 + 方法论 15 条 + 概念清单
@@ -147,11 +152,11 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
 ~/桌面/serverai/         ← 网上找的参考实现 day2~day6（只对照，不照抄）
 ```
 
-⚠ **`p2` 和 `epoll` 都监听 8888**，同时只能开一个。两个测试脚本也都默认连 8888 ——
+⚠ **四个服务器（`p2` / `epoll` / `thread` / `thread_uev`）都监听 8888**，同时只能开一个。测试脚本也都默认连 8888 ——
 跑哪个测试取决于起的是哪个服务器（起 `build/epoll` 却跑 `p2_test.py` 会一片红）。
 
-**git**：分支 `main` + `cp5-halfpacket`，已推到 origin。
-**写这份时的最新提交**：CP6b（分机纳入 epoll + fd 配平）—— 哈希跑 `git log --oneline -1` 看。
+**git**：分支 `main`（另有旧的 `cp5-halfpacket`，都已推到 origin）。
+**写这份时的最新提交**：`a4396a0`（删掉三条非主线代码）—— 本地领先 origin 2 个提交，推送走 VS Code。
 
 ⚠ **命令行推不了**：本机没有 git 凭证（无 `credential.helper`、无 `~/.git-credentials`、
 无 token、`gh` 未登录），`git push` 会报
@@ -233,6 +238,8 @@ python3 tests/emfile_test.py              #    健壮性：fd 撞上限后不许
    ⚠ 验收标准是 **`p2_test.py` 23/23 对着 `build/epoll` 跑** —— 搬迁前实测 0/23，现在 23/23
 ✅ CP6d-1 EMFILE 忙等：撞 fd 上限后**暂停接收**（`EPOLL_CTL_DEL`），腾出 fd 再恢复
 ✅ CP6d-2 keep-alive：一条连接服务多个请求（`want_close` + `inbuf.erase` + 循环解析）
+✅ 线程池版 `src/thread.cpp`（单 Reactor + 线程池；`/work` 吃 CPU 的业务实测 79 → 262 req/s）
+✅ 统一事件源 `src/thread_uev.cpp`（signalfd 进 epoll + 优雅停机；SIGTERM 在途请求不丢）
 ▶  下一步 CP6d-3：部分写（`send` 返回 < n → 输出缓冲 + `EPOLLOUT`）
    ⚠ 现在**撞不到**（响应 117 字节 ≪ 发送缓冲区 16384）→ 按 TDD 规矩先不动
 ```
@@ -270,7 +277,7 @@ echo 用例随 CP6c-2 退役，详见下一节）
 >
 > **教训：验收标准本身也要被验证 —— 要问"反例能不能通过"。**
 
-**之后的路线**：CP6d-3 部分写 → 然后 day5 线程池
+**之后的路线**：CP6d-3 部分写 → 线程池（已完成，见 `src/thread.cpp` / `thread_uev.cpp`）→ day6 MySQL 连接池
 
 ### CP6d 做了什么（两项完成，一项**故意**留着）
 

@@ -204,7 +204,7 @@ BIN=build/epoll SRC=src/epoll.cpp TAG=k- KEEPALIVE=true  ./tests/load_test.sh   
 - **`notes/learning_progress.md`** —— 进度、方法论、已掌握的概念清单
 - **`notes/epoll_notes.md`** —— epoll 技术专题
 - **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
-- **`notes/stress.md`** —— JMeter 压测**数字**：第 1 节 `p2`（阻塞版）、第 2 节 `epoll`（keep-alive），含压测工具自身的两个坑
+- **`notes/stress.md`** —— JMeter 压测**数字**：第 1 节 `p2`（阻塞版）、第 2 节 `epoll`（keep-alive），含压测工具自身的三个坑
 - **`notes/loadtest_guide.md`** —— 压测**方法**：测什么 / 六种类型 / 七条方法论 / 怎么看 `.jtl` / 同时观察什么
 
 ## 说明

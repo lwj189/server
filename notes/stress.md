@@ -169,22 +169,21 @@ SRV_ARGS="--workers 4 --quiet" BIN=build/thread SRC=src/thread.cpp TAG=q4- \
 
 ### 8.1 已补测（2026-11-04）
 
-新增 `tests/edge_test.py`，四个探针在 epoll / thread / thread_uev 上各 6 项全过：
+新增 `tests/edge_test.py`，四个探针在 epoll / thread 上各 6 项全过：
 
 | 探针 | 做什么 | 结果 |
 | --- | --- | --- |
-| 分片发送 | 请求分两次发（前 20B，等 0.2s 再发其余） | 三台都返回 200 |
-| 半关闭 | 发完请求后 `shutdown(SHUT_WR)` | 三台都收到 200，随后 EOF |
-| 慢连接隔离 | 一条只发半个请求头挂着，另一条请求 `/` | 全部通过；thread_uev 首字节 0.3ms、epoll 0.8ms |
-| 流水线部分写 | 一次灌 30,000 个请求、不读响应 | thread/thread_uev 收掉旧连接；epoll 修复后同样收掉；新连接均正常 |
+| 分片发送 | 请求分两次发（前 20B，等 0.2s 再发其余） | 两台都返回 200 |
+| 半关闭 | 发完请求后 `shutdown(SHUT_WR)` | 两台都收到 200，随后 EOF |
+| 慢连接隔离 | 一条只发半个请求头挂着，另一条请求 `/` | 全部通过；epoll 0.8ms、thread 同量级 |
+| 流水线部分写 | 一次灌 30,000 个请求、不读响应 | thread 收掉旧连接；epoll 修复后同样收掉；新连接均正常 |
 
 - **epoll 部分写修复**：`src/epoll.cpp` 的发送改为循环 + `EINTR` 重试；`send` 部分写或失败 → `want_close=true`，由调用方统一 `close` + 销账。没有 outbuf/EPOLLOUT，策略与 thread 一致（一次发不完就收连接）。
 - 回归：epoll `p2_test` 23/23、`keepalive_test` 7/7、`emfile_test` 2/2。
-- 复现：`python3 tests/edge_test.py --bin build/epoll`（thread / thread_uev 把 `--bin` 换掉即可）。
+- 复现：`python3 tests/edge_test.py --bin build/epoll`（thread 把 `--bin` 换掉即可）。
 
 ### 8.2 还没测的 / 不能当结论的
 
 - **客户端分离**（Windows 或另一台 VM 跑 JMeter）——唯一能把 3.3× 找回来、并确认 400 并发是否客户端饱和的办法；仍未做。
-- **thread_uev 的 close / `/work` 压测**：keepalive 已补（100/200/400 并发 = 12,422 / 16,000 / 19,517 req/s，0 失败）；close 与 `/work` 只跑了同通信路径的 thread，thread_uev 未单独跑。
 - **close 模式 200/400**：epoll 跑过，200×200 = 6,792/s、94 失败；400×200 = 4,755/s、1,012 失败（ConnectTimeout 为主）。同机 JMeter 与服务器抢 4 vCPU，不能当服务器容量结论，需客户端分离后重测。
 - **p2 的慢连接/部分写**：p2 是阻塞单线程基线，没有输出缓冲；慢客户端预期会卡住整个进程，本轮没有把它做成正式测试（expected fail，不是回归）。

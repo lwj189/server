@@ -8,7 +8,7 @@
 CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 → CP5 半包/粘包 ✅ → CP6a~d epoll / EMFILE / keep-alive ✅ → 线程池 ✅
 
-`src/` 下是四个可执行目标。跑测试的三个（p2 / epoll / thread）在 CI 里全绿，thread_uev 只保证严格编译零警告（逻辑同 thread）：
+`src/` 下是三个可执行目标：
 
 | 文件 | 并发模型 | 真实代码行 |
 | --- | --- | --- |
@@ -21,19 +21,17 @@ CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 ```bash
 mkdir -p build        # 产物统一输出到 build/（已 gitignore；清理就是 rm -rf build）
 
-# 四个手写版（严格编译：有警告就说明代码不干净）
+# 三个手写版（严格编译：有警告就说明代码不干净）
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/p2.cpp         -o build/p2
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/epoll.cpp      -o build/epoll
 g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread.cpp     -o build/thread -pthread
-g++ -std=c++17 -Wall -Wextra -Wformat=2 -Wconversion src/thread_uev.cpp -o build/thread_uev -pthread
 
 # 起一个（⚠ 都占 8888，同时只能跑一个）
 ./build/epoll                                  # 或 ./build/p2
 ./build/thread --workers 4                     # 线程池版
-./build/thread_uev --workers 4                 # 线程池 + signalfd，Ctrl+C 会优雅停机
 ```
 
-端口：默认 8888，写在各自源码顶部的 `constexpr uint16_t PORT`；`thread` / `thread_uev` 支持 `--port N`。
+端口：默认 8888，写在各自源码顶部的 `constexpr uint16_t PORT`；`thread` 支持 `--port N`。
 
 另一个终端里访问：
 
@@ -58,7 +56,6 @@ python3 tests/p2_test.py --port 9999
 # 边界行为（自己起服务器：分片发送 / 半关闭 / 慢连接隔离 / 流水线部分写）
 python3 tests/edge_test.py --bin build/epoll
 python3 tests/edge_test.py --bin build/thread
-python3 tests/edge_test.py --bin build/thread_uev
 ```
 
 覆盖 5 个用例：
@@ -111,8 +108,8 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 | 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
 | 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 已确认：p2 100/200 并发 26/93 个 ConnectTimeout；epoll/thread（4096）到 400 并发 0 失败 |
 | 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`src/epoll.cpp`） |
-| 5 | `send` 未处理部分写 | 响应很大 + 慢客户端时可能发不完整 | ✅ `thread.cpp` / `thread_uev.cpp` 已加全量校验（`EINTR` 重试；部分写一律按"收掉这条连接"处理）。真正支持要加输出缓冲 + `EPOLLOUT`，暂未做 |
-| 6 | 没有优雅退出 | `SIGTERM` 直接死，在途请求丢 | ✅ `src/thread_uev.cpp` 已修（`signalfd` 统一事件源 + `drain()` 线程池 + 关空闲连接） |
+| 5 | `send` 未处理部分写 | 响应很大 + 慢客户端时可能发不完整 | ✅ `thread.cpp` 已加全量校验（`EINTR` 重试；部分写一律按"收掉这条连接"处理）。真正支持要加输出缓冲 + `EPOLLOUT`，暂未做 |
+| 6 | 没有优雅退出 | `SIGTERM` 直接死，在途请求丢 | ⬜ `thread.cpp` 未做（收到 `SIGTERM` 直接退出） |
 | 7 | 没有日志系统 | 只有 `std::cout` + 一把锁 | ⬜ 后续 |
 | 8 | **每个请求都写 5 行日志到 stdout** | 压测时这是**同步阻塞 IO**（`std::endl` 会 flush） | ⬜ 已验证不是瓶颈：thread 开日志 vs `--quiet` 差异 <5%（197~215 vs 201~211 req/s） |
 
@@ -124,14 +121,12 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 │   ├── p2.cpp                  阻塞版服务器（CP1~CP5）：一次只能服务一条连接，任何路径都回 Hello
 │   ├── epoll.cpp               单线程 Reactor 版（CP6a~CP6d）：一个线程 + 一个 epoll
 │   ├── thread.cpp              单 Reactor + 线程池版：主线程管 IO，工人算业务
-│   ├── thread_uev.cpp          上者 + signalfd 统一事件源 + 优雅停机（单文件自包含）
 │   ├── http.hpp                三个手写服务器【共用】的 HTTP 逻辑
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   └── thread_pool.hpp         线程池类（只有一份，thread.cpp include 它）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
 ├── notes/                      ← 笔记（7 份入库）
-├── tests/                      ← 测试（5 套 Python，其中 4 套进 CI；另有压测驱动）
-├── .github/workflows/ci.yml    CI：严格编译 + 跑 4 套测试
+├── tests/                      ← 测试（5 套 Python；另有压测驱动）
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
 └── README.md
@@ -140,14 +135,13 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 > 📌 **产物全在 `build/`**：源码旁边永远是干净的。清理只需 `rm -rf build`。
 > 重编：见下面「编译运行」。
 
-**四个服务器怎么选**：
+**三个服务器怎么选**：
 
 | 想干什么 | 用哪个 |
 | --- | --- |
 | 看最朴素的阻塞写法（对照用） | `build/p2` |
 | 看事件驱动、跑协议/配平测试 | `build/epoll` |
 | 看线程池怎么和 epoll 配合 | `build/thread --workers 4` |
-| 看信号怎么进 epoll、怎么优雅停机 | `build/thread_uev --workers 4` |
 
 ## 学习笔记索引
 

@@ -15,7 +15,7 @@
 ```
 day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP5a ✅ → CP5b ✅
    → 修 3 个解析问题 ✅ → day4：CP6a ✅ → CP6b ✅ → CP6c-1 ✅ → CP6c-2 ✅
-   → 线程池版 ✅（src/thread.cpp）→ 统一事件源 ✅（src/thread_uev.cpp：signalfd + 优雅停机）
+   → 线程池版 ✅（src/thread.cpp）
    → CP6d 加固：EMFILE 忙等 ✅ / keep-alive ✅ / 部分写 ⬜（等响应变大）
    → **C++ 靶场：请求行解析 ⬅ 已移出仓库**（需要时从分支对话恢复）
 ```
@@ -23,8 +23,7 @@ day2.cpp 逐行读懂 ✅ → CP1 ✅ → CP2 ✅ → CP3 ✅ → CP4 ✅ → CP
 练习文件：`src/p2.cpp`（自己手写，**阻塞版**，CP1~CP5）
 　　　　　`src/epoll.cpp`（**day4 练习**，事件驱动 HTTP 服务器，323 行 / 代码 194）
 　　　　　`src/thread.cpp`（单 Reactor + 线程池，538 行 / 代码 317）
-　　　　　`src/thread_uev.cpp`（thread + signalfd + 优雅停机，923 行 / 代码 634）
-自动化验收 —— **4 套脚本 / 共 36 项检查**：p2 / epoll / thread 三台全绿，thread_uev 也跑过 23+4+7+2：
+自动化验收 —— **4 套脚本 / 共 36 项检查**：p2 / epoll / thread 三台全绿：
 
 | 脚本 | 测什么 | 结果 |
 | --- | --- | --- |
@@ -692,7 +691,7 @@ g++ -std=c++17 /tmp/t.cpp -o /tmp/t && /tmp/t
       · ⚠ 现在**撞不到**：一次响应 117 字节 ≪ 发送缓冲区 16384 字节
       · 按 TDD 规矩"**写不出会红的测试就别改代码**" → 等响应变大 / 长连接压测时再回来
 - [ ] **idle 超时**：keep-alive 的配套 —— 对端不关也不发时，连接会一直占着 fd
-- [x] `day5.cpp`：`epoll` + 线程池 ✅ 已完成 → `src/thread.cpp`（另有 `src/thread_uev.cpp`：signalfd + 优雅停机）
+- [x] `day5.cpp`：`epoll` + 线程池 ✅ 已完成 → `src/thread.cpp`
 - [ ] `day6.cpp`：MySQL 连接池 + 预处理语句
 
 > 为什么 keep-alive 排在 epoll 后面：阻塞模型下一个 keep-alive 连接会**永久占住**唯一的服务线程，反而放大弱点。

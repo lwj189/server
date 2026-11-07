@@ -153,7 +153,6 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 
 每份笔记**只有一个职责**，同一件事不会写在两个地方：
 
-- **`notes/HANDOFF.md`** —— 新对话读的第一份：我是谁 / 怎么教我 / 项目现状 / 下一步
 - **`notes/pitfalls.md`** —— **全部踩过的坑**（CP1~CP6d）+ 元教训。每条包含现象、根因、修法、验证方式。例如：
   - `bool reuse` 让 `setsockopt` 返回 `EINVAL`（内核要求 `optlen >= sizeof(int)`）
   - `EADDRINUSE` 的两种成因（TIME_WAIT vs 有活进程），以及为什么 `SO_REUSEADDR` 只救得了前者
@@ -164,6 +163,3 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 - **`notes/loadtest_guide.md`** —— 压测**方法**：测什么 / 六种类型 / 七条方法论 / 怎么看 `.jtl` / 同时观察什么
 - **`notes/stress.md`** —— 2026-11-04 重跑的**数据**：口径 / p2 / epoll / thread / 结论（和上一份的方法配套）
 
-## 说明
-
-- 这是个人学习项目，代码追求"每一行都能解释为什么"，不追求生产可用。

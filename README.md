@@ -1,17 +1,12 @@
 # p2 —— 从零手写的 Linux TCP / HTTP 服务器
 
-一个学习用的极简 HTTP 服务器：纯 C++17，不依赖任何框架，只用 Linux 系统调用和 C++ 标准库。
-目的不是"造轮子"，而是把 `socket → bind → listen → accept → read → send → close` 这条链路**亲手写通、写对、压过**。
+一个学习用的极简 HTTP 服务器
 
-
----
 
 ## 当前状态
 
-```
 CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 → CP5 半包/粘包 ✅ → CP6a~d epoll / EMFILE / keep-alive ✅ → 线程池 ✅
-```
 
 `src/` 下是四个可执行目标。跑测试的三个（p2 / epoll / thread）在 CI 里全绿，thread_uev 只保证严格编译零警告（逻辑同 thread）：
 
@@ -20,7 +15,6 @@ CP1 socket/bind/listen ✅ → CP2 accept ✅ → CP3 read ✅ → CP4 send ✅
 | `src/p2.cpp` | 阻塞串行（一次一条连接） | 172 |
 | `src/epoll.cpp` | 单线程 Reactor | 194 |
 | `src/thread.cpp` | 单 Reactor + 线程池 | 370 |
-| `src/thread_uev.cpp` | 上者 + `signalfd` 统一事件源（含优雅停机） | 634 |
 
 ## 编译与运行
 

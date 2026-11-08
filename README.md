@@ -84,7 +84,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 #### 实测数据（2026-11-04 重跑，当前 HEAD）
 
 同机压测：4 vCPU i7-13700HX / 15 GiB / `127.0.0.1`，JMeter 5.6.3 与服务器抢 CPU。
-完整口径、两轮区间、原始 `.jtl` 文件名见 **`notes/stress.md`**。只列关键档（未注明即 0 失败）：
+原始 `.jtl` 在 `tests/results/`（不入库）。只列关键档（未注明即 0 失败）：
 
 | 场景 | 并发 | 吞吐 req/s | 说明 |
 | --- | --- | --- | --- |
@@ -97,7 +97,7 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 | thread `/work` 4 工人 | 4×500 | 197~215 | ~2.8 核；约 2.5× |
 
 ⚠ 同机压测时 JMeter 与服务器抢 4 个 vCPU，400 并发可能是客户端先饱和；这些数字用于**同环境对比**，
-不要和旧数据或其他机器横比。旧记录 79→262（3.3×）在本机未复现，原因见 `notes/stress.md` 4.2 节。
+不要和旧数据或其他机器横比。旧记录 79→262（3.3×）在本机未复现。
 
 
 ## 已知限制（哪些已修、哪些还没修）
@@ -125,7 +125,6 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   └── thread_pool.hpp         线程池类（只有一份，thread.cpp include 它）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
-├── notes/                      ← 笔记（7 份入库）
 ├── tests/                      ← 测试（5 套 Python；另有压测驱动）
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore
@@ -142,18 +141,3 @@ PORT=9999 ./tests/load_test.sh                        # 换端口
 | 看最朴素的阻塞写法（对照用） | `build/p2` |
 | 看事件驱动、跑协议/配平测试 | `build/epoll` |
 | 看线程池怎么和 epoll 配合 | `build/thread --workers 4` |
-
-## 学习笔记索引
-
-每份笔记**只有一个职责**，同一件事不会写在两个地方：
-
-- **`notes/pitfalls.md`** —— **全部踩过的坑**（CP1~CP6d）+ 元教训。每条包含现象、根因、修法、验证方式。例如：
-  - `bool reuse` 让 `setsockopt` 返回 `EINVAL`（内核要求 `optlen >= sizeof(int)`）
-  - `EADDRINUSE` 的两种成因（TIME_WAIT vs 有活进程），以及为什么 `SO_REUSEADDR` 只救得了前者
-  - `EMFILE`（本进程 fd 用光）vs `ENFILE`（整机用光）—— 填错的表现是"空转照旧"
-- **`notes/learning_progress.md`** —— 进度、方法论、已掌握的概念清单
-- **`notes/epoll_notes.md`** —— epoll 技术专题
-- **`notes/selfcheck.md`** —— 自检 69 题（先自己答，再往下翻答案）
-- **`notes/loadtest_guide.md`** —— 压测**方法**：测什么 / 六种类型 / 七条方法论 / 怎么看 `.jtl` / 同时观察什么
-- **`notes/stress.md`** —— 2026-11-04 重跑的**数据**：口径 / p2 / epoll / thread / 结论（和上一份的方法配套）
-

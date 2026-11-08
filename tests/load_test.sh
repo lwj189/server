@@ -140,7 +140,7 @@ echo "    HTML 报告：$JMETER -g $OUTDIR/${LABEL}.jtl -o $OUTDIR/report"
 # 它只是过程日志，数字全在 .jtl 里；不清的话 results/ 跑几次就爆（实测清完 31M，
 # 重跑两轮又回到 49M）。想留着排查就 KEEP_LOGS=1。
 #
-# ⚠ .jtl 一律【不清】：那是所有数字的唯一证据（notes/stress.md 引用它们）。
+# ⚠ .jtl 一律【不清】：那是所有数字的唯一证据。
 if [ "${KEEP_LOGS:-0}" != "1" ]; then
     rm -f "$OUTDIR/srv.log" "$OUTDIR/build.log" "$OUTDIR"/*.jmeter.log
     echo "==> 已清掉过程日志（srv.log / build.log / *.jmeter.log）—— 要保留请加 KEEP_LOGS=1"

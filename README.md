@@ -43,30 +43,51 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8888/   # 只打印状
 
 ## 测试
 
-### 冒烟 + 健壮性测试（无需额外依赖）
+### 5 套脚本 / 42 项断言
+
+| 脚本 | 项数 | 怎么跑 | 测什么 |
+| --- | ---: | --- | --- |
+| `tests/p2_test.py` | 23 | 先手动起服务器，再 `python3 tests/p2_test.py` | 协议正确性 + 健壮性（13 个场景） |
+| `tests/edge_test.py` | 6 | `--bin build/epoll`（自己起服务器） | 4 个边界探针：分片 / 半关闭 / 慢连接隔离 / 流水线部分写 |
+| `tests/keepalive_test.py` | 7 | `--bin build/epoll` | 连接复用 / 流水线 / `Connection: close` 回归 |
+| `tests/emfile_test.py` | 2 | `--bin build/epoll`（`--limit 64` 卡住 fd 上限） | fd 耗尽时要干净报错，不能死循环 |
+| `tests/balance_test.py` | 4 | 对着已起的服务器，加 `--log <服务器日志>` | fd 账本配平（开完关完回落到基线）+ 哨兵没响 |
+
+`epoll` 与 `thread` 上 42 项全过（2026-11-08 复核）。`p2` 是阻塞基线，只有 keep-alive 那条不满足
+（3/7）——一次只服务一条连接，本来就不支持复用，这是对照结论不是回归。
 
 ```bash
 # 终端1：启动服务器
-build/p2
+build/p2            # 或 build/epoll、build/thread --workers 4
 
 # 终端2：
 python3 tests/p2_test.py                 # 默认 127.0.0.1:8888
 python3 tests/p2_test.py --port 9999
+python3 tests/balance_test.py --log /tmp/server.log
 
-# 边界行为（自己起服务器：分片发送 / 半关闭 / 慢连接隔离 / 流水线部分写）
-python3 tests/edge_test.py --bin build/epoll
-python3 tests/edge_test.py --bin build/thread
+# 自己起服务器的三套（会自己拉起 --bin 指定的二进制）
+python3 tests/edge_test.py      --bin build/epoll
+python3 tests/keepalive_test.py --bin build/epoll
+python3 tests/emfile_test.py    --bin build/epoll
 ```
 
-覆盖 5 个用例：
+### `p2_test.py` 的 13 个场景
 
-| # | 用例 | 断言 |
+| # | 场景 | 断言 |
 | --- | --- | --- |
-| 1 | 正常请求 | 200 + 响应体正确 + `Content-Length` 与实际字节数一致 |
+| 1 | 完整请求一次发出 | 200 + 响应体正确 + `Content-Length` 与实际字节一致 |
 | 2 | **连上就关**（端口扫描 / 健康检查） | 服务器必须活下来并继续服务 |
 | 3 | **RST 强断**（发一半请求后 `SO_LINGER=0`） | 服务器必须活下来并继续服务 |
 | 4 | 并发 20 | 全部返回 200 |
-| 5 | 半包观察（分两段发送） | 只记录现象，不计入失败（CP5 才修） |
+| 5 | 半包：分两段发，中间隔 0.5 s | 收全才响应（CP5） |
+| 6 | 极端半包：每个字节单独发 | 收全才响应 |
+| 7 | 超长请求头（16 KB 且永不出现空行） | 拒绝或断开，不能无限等 |
+| 8 | 带 body 的 POST | 200，且 body 被完整收下 |
+| 9 | 声明 `Content-Length: 10` 但只发 5 字节 | 不能先回 200（CP5b） |
+| 10 | 声明 64 MB body 却一个字节不发 | 拒绝或断开，不能挂住 |
+| 11 | 头字段名写成小写 `content-length` | 大小写不敏感（RFC 9110 §5.1） |
+| 12 | 冒号后没有空格 `Content-Length:5` | OWS 可选（RFC 9112 §5） |
+| 13 | `Content-Length` 的值不是纯数字 | 非法值必须拒绝 |
 
 用例 2/3 是回归测试：**单个坏客户端不该杀死服务器**（对应"响应只在 `n > 0` 时发送" + 忽略 `SIGPIPE`）。
 
@@ -168,7 +189,7 @@ e1000 模拟网卡，RPS 只增加跨核转发开销：`NET_RX` 软中断次数�
 | --- | --- | --- | --- |
 | 1 | **一次 `read` ≠ 一个完整请求** | 客户端分片发送时，服务器会基于不完整的请求就响应 | ✅ CP5 已修（`inbuf` + 定界） |
 | 2 | **阻塞式单连接** | 一个连上却不发数据的客户端就能卡住整个服务器 | ✅ CP6b 已修（非阻塞 + `epoll`） |
-| 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 已确认：p2 100/200 并发 26/93 个 ConnectTimeout；epoll/thread（4096）到 400 并发 0 失败 |
+| 3 | `backlog = 3` | 爬坡瞬间（几百条 SYN 同时到）仍会丢连接 | 🔶 已确认：p2 100/200 并发 26/93 个 ConnectTimeout；epoll/thread（`SOMAXCONN`，本机约 4096）到 400 并发 0 失败 |
 | 4 | 不支持 keep-alive | 每个请求都要重新建连，`TIME_WAIT` 堆积 | ✅ CP6d-2 已修（`src/epoll.cpp`） |
 | 5 | `send` 未处理部分写 | 响应很大 + 慢客户端时可能发不完整 | ✅ `thread.cpp` 已加全量校验（`EINTR` 重试；部分写一律按"收掉这条连接"处理）。真正支持要加输出缓冲 + `EPOLLOUT`，暂未做 |
 | 6 | 没有优雅退出 | `SIGTERM` 直接死，在途请求丢 | ⬜ `thread.cpp` 未做（收到 `SIGTERM` 直接退出） |
@@ -187,7 +208,7 @@ e1000 模拟网卡，RPS 只增加跨核转发开销：`NET_RX` 软中断次数�
 │   │                           （ClientContext / 解析 / 拼响应 / 线程安全日志）
 │   └── thread_pool.hpp         线程池类（只有一份，thread.cpp include 它）
 ├── build/                      ← 构建产物（已 gitignore；rm -rf build/ 就是彻底清理）
-├── tests/                      ← 测试（5 套功能测试 / 40 项 + 1 个空闲连接内存测量；另有压测驱动）
+├── tests/                      ← 测试（5 套脚本 / 42 项断言 + 1 个空闲连接内存测量；另有压测驱动）
 ├── docs/charts/                ← 压测图表（README 里引用的 4 张 PNG）
 ├── .clang-format               代码风格约束（缩进 4 空格、指针贴左…）
 ├── .gitignore

@@ -318,16 +318,23 @@ int main(int argc, char** argv) {
             return (a == "--help" || a == "-h") ? 0 : 2;
         }
     }
-    if (workers == 0) workers = 1;
+    if (workers == 0) {
+        logLine("内部错误：workers == 0，默认值和校验逻辑被破坏");
+        return 1;
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return 1; }
+    if (server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
 
     int reuse = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
-        perror("setsockopt"); return 1;
+        perror("setsockopt");
+        return 1;
     }
 
     struct sockaddr_in address{};
@@ -336,25 +343,32 @@ int main(int argc, char** argv) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind"); return 1;
+        perror("bind");
+        return 1;
     }
     if (listen(server_fd, SOMAXCONN) < 0) {   // backlog 拉满，同 epoll.cpp 的教训
-        perror("listen"); return 1;
+        perror("listen");
+        return 1;
     }
 
     int flags = fcntl(server_fd, F_GETFL, 0);
     if (flags == -1 || fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl"); return 1;
+        perror("fcntl");
+        return 1;
     }
 
     g_epoll_fd = epoll_create1(0);
-    if (g_epoll_fd < 0) { perror("epoll_create1"); return 1; }
+    if (g_epoll_fd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
 
     struct epoll_event ev{};
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
-        perror("epoll_ctl: server_fd"); return 1;
+        perror("epoll_ctl: server_fd");
+        return 1;
     }
 
     ThreadPool pool(workers);   // 析构顺序：pool 必须比 g_pool 活得久
